@@ -1,0 +1,25 @@
+brp_a1_5x_all = list(brr1['brp']['a1']+ brr2['brp']['a1']+ brr3['brp']['a1']+ brr4['brp']['a1'] + brr5['brp']['a1'])
+brp_a2_5x_all = list(brr1['brp']['a2']+ brr2['brp']['a2']+ brr3['brp']['a2']+ brr4['brp']['a2'] + brr5['brp']['a2'])
+brp_a3_5x_all = list(brr1['brp']['a3']+ brr2['brp']['a3']+ brr3['brp']['a3']+ brr4['brp']['a3'] + brr5['brp']['a3'])
+
+hsp_a1_5x_all = list(brr1['hsp']['a1']+ brr2['hsp']['a1']+ brr3['hsp']['a1']+ brr4['hsp']['a1'] + brr5['hsp']['a1'])
+hsp_a2_5x_all = list(brr1['hsp']['a2']+ brr2['hsp']['a2']+ brr3['hsp']['a2']+ brr4['hsp']['a2'] + brr5['hsp']['a2'])
+hsp_a3_5x_all = list(brr1['hsp']['a3']+ brr2['hsp']['a3']+ brr3['hsp']['a3']+ brr4['hsp']['a3'] + brr5['hsp']['a3'])
+
+mito_a1_5x_all = list(brr1['mito']['a1']+ brr2['mito']['a1']+ brr3['mito']['a1']+ brr4['mito']['a1'] + brr5['mito']['a1'])
+mito_a2_5x_all = list(brr1['mito']['a2']+ brr2['mito']['a2']+ brr3['mito']['a2']+ brr4['mito']['a2'] + brr5['mito']['a2'])
+mito_a3_5x_all = list(brr1['mito']['a3']+ brr2['mito']['a3']+ brr3['mito']['a3']+ brr4['mito']['a3'] + brr5['mito']['a3'])
+
+
+
+brp_a1_1x_all = list(brr6['brp']['a1']+ brr7['brp']['a1']+ brr8['brp']['a1']+ brr9['brp']['a1'])
+brp_a2_1x_all = list(brr6['brp']['a2']+ brr7['brp']['a2']+ brr8['brp']['a2']+ brr9['brp']['a2'])
+brp_a3_1x_all = list(brr6['brp']['a3']+ brr7['brp']['a3']+ brr8['brp']['a3']+ brr9['brp']['a3'])
+
+hsp_a1_1x_all = list(brr6['hsp']['a1']+ brr7['hsp']['a1']+ brr8['hsp']['a1']+ brr9['hsp']['a1'])
+hsp_a2_1x_all = list(brr6['hsp']['a2']+ brr7['hsp']['a2']+ brr8['hsp']['a2']+ brr9['hsp']['a2'])
+hsp_a3_1x_all = list(brr6['hsp']['a3']+ brr7['hsp']['a3']+ brr8['hsp']['a3']+ brr9['hsp']['a3'])
+
+mito_a1_1x_all = list(brr6['mito']['a1']+ brr7['mito']['a1']+ brr8['mito']['a1']+ brr9['mito']['a1'])
+mito_a2_1x_all = list(brr6['mito']['a2']+ brr7['mito']['a2']+ brr8['mito']['a2']+ brr9['mito']['a2'])
+mito_a3_1x_all = list(brr6['mito']['a3']+ brr7['mito']['a3']+ brr8['mito']['a3']+ brr9['mito']['a3'])
