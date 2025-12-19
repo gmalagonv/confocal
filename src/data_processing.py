@@ -9,7 +9,7 @@ import os
 import matplotlib.pyplot as plt
 import platform
 
-
+from pathlib import Path
 
 def loader2(date,user,split_frames=False, server=False):
     
@@ -115,7 +115,14 @@ def signal_extractor(mask_file_path, file_path, force_one_roi= False, print_area
      
     return results   
                     
-
+def pooler(signals,mask, channel, mask_number):
+    pooled = []
+    for sig in signals:
+        val = sig[mask][channel][str(mask_number)]
+        pooled.append(val)
+    return pooled
+    
+    
 
 def plot_bars_with_sem3(groups, labels=None, ylabel="Value", figsize=(3,6),
                        bar_color="lightgray", pattern = '', dot_color="black", spine_width=2):
@@ -197,3 +204,159 @@ def plot_bars_with_sem3(groups, labels=None, ylabel="Value", figsize=(3,6),
 
     plt.tight_layout()
     return ax
+
+
+
+
+
+def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=False):
+    """_summary_
+
+    Args:
+        date (_type_): _description_
+        user (_type_): _description_
+        series_n (_type_): _description_
+        suffix_masks (_type_): _description_
+        server (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        _type_: _description_
+    """
+    
+    system = platform.system()
+    if system == 'Linux':
+        home = '/home'
+    elif system == 'Darwin':
+        home = '/Users'
+    
+    if server:
+        base_dir = home + '/gerard/ITB/home/data/confocal'
+    else:
+        base_dir = home + '/gerard/data/confocal'
+    
+    all_path = os.path.join(base_dir, f"{date}_{user}")
+    
+    series = 'series_' + str(series_n)
+    s = 's' + str(series_n)
+    
+    
+    
+    signals = {}
+    for masks_suffix in masks_suffixes:
+        mask = f'{all_path}/{series}/masks/msk_{masks_suffix}.tif'
+        
+        
+        path = Path(f'{all_path}/{series}/projections/')
+        # print(path)
+
+        substring = masks_suffix
+
+        files = [
+            p for p in path.iterdir()
+            if (
+                p.is_file()
+                and not p.name.startswith(".")   # exclude ._*, .DS_Store, etc.
+                and substring in p.name          # keep only names containing substring
+
+            )
+        ]
+        signals[masks_suffix] = {}
+        for chn, f in enumerate(files):
+            print(f)
+            # signals[masks_suffix][str(chn)] = signal_extractor(mask, f)
+            s = signal_extractor(mask, f)
+            if channels_suffixes:
+                key_channel = channels_suffixes[chn]
+            else:
+                key_channel = 'ch' + str(chn)
+
+            signals[masks_suffix][key_channel] = s['0']
+            # signals[masks_suffix][str(chn)] = signal_extractor(mask, f)
+
+    
+    return signals      
+    
+    # def ratios(signals, left_numerator, right_numerator, left_denominator, right_denominator):
+        
+    #     pass
+
+
+
+    # al = signal_extractor(msk_AL, f'{all_path}/{series}/projections/{date}_{s}_ch0_AL.tif')
+    
+    # brp = signal_extractor(msk, f'{all_path}/{series}/projections/{date}_{s}_ch0_MBa.tif')
+    # mito = signal_extractor(msk, f'{all_path}/{series}/projections/{date}_{s}_ch1_MBa.tif')
+    # hsp = signal_extractor(msk, f'{all_path}/{series}/projections/{date}_{s}_ch2_MBa.tif')
+
+    # denominatorL = al['0']['1']
+    # denominatorR = al['0']['2']
+    
+    # results = {}
+    # for channel in channels:
+    #     results[channel] = {}
+    # # results['brp'] = {}
+    # # results['mito'] = {}
+    # # results['hsp'] = {}
+    
+    # results['brp']['a1'] = brp['0']['1'] / denominatorL, brp['0']['4'] / denominatorR
+    # results['brp']['a2'] = brp['0']['2'] / denominatorL, brp['0']['5'] / denominatorR
+    # results['brp']['a3'] = brp['0']['3'] / denominatorL, brp['0']['6'] / denominatorR
+
+    # results['mito']['a1'] = mito['0']['1'] / denominatorL, mito['0']['4'] / denominatorR
+    # results['mito']['a2'] = mito['0']['2'] / denominatorL, mito['0']['5'] / denominatorR
+    # results['mito']['a3'] = mito['0']['3'] / denominatorL, mito['0']['6'] / denominatorR
+ 
+    
+    # results['hsp']['a1'] = hsp['0']['1'] / denominatorL, hsp['0']['4'] / denominatorR
+    # results['hsp']['a2'] = hsp['0']['2'] / denominatorL, hsp['0']['5'] / denominatorR
+    # results['hsp']['a3'] = hsp['0']['3'] / denominatorL, hsp['0']['6'] / denominatorR
+    
+
+    
+    
+    # return results
+
+
+
+
+
+def raw_values(series_n):
+    
+    series = 'series_' + str(series_n)
+    s = 's' + str(series_n)
+    
+    results = {}
+    results['brp'] = {}
+    results['mito'] = {}
+    results['hsp'] = {}
+    
+    msk_AL = f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/masks/msk_AL.tif'
+    msk_MBa = f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/masks/msk_MBa.tif'
+    
+    
+    al = signal_extractor(msk_AL, f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/projections/2025_11_29_{s}_ch0_AL.tif')
+    brp = signal_extractor(msk_MBa, f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/projections/2025_11_29_{s}_ch0_MBa.tif')
+    mito = signal_extractor(msk_MBa, f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/projections/2025_11_29_{s}_ch1_MBa.tif')
+    hsp = signal_extractor(msk_MBa, f'/home/gerard/data/confocal/2025_11_29_Gerardo/{series}/projections/2025_11_29_{s}_ch2_MBa.tif')
+    
+    
+    results['brp']['a1'] = brp['0']['1'], brp['0']['4']
+    results['brp']['a2'] = brp['0']['2'], brp['0']['5'] 
+    results['brp']['a3'] = brp['0']['3'], brp['0']['6']
+
+    results['mito']['a1'] = mito['0']['1'], mito['0']['4']
+    results['mito']['a2'] = mito['0']['2'], mito['0']['5']
+    results['mito']['a3'] = mito['0']['3'], mito['0']['6']
+ 
+    
+    results['hsp']['a1'] = hsp['0']['1'], hsp['0']['4']
+    results['hsp']['a2'] = hsp['0']['2'], hsp['0']['5']
+    results['hsp']['a3'] = hsp['0']['3'], hsp['0']['6']
+    
+    
+    results['al'] =  al['0']['1'], al['0']['2']
+    
+
+    
+    
+    return results
