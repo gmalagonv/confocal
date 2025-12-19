@@ -11,20 +11,24 @@ import platform
 
 
 
-def loader2(date,user,split_frames=False):
+def loader2(date,user,split_frames=False, server=False):
     
     """_summary_
     
     """
     system = platform.system()
-    
     if system == 'Linux':
         home = '/home'
     elif system == 'Darwin':
         home = '/Users'
     
-    base_dir = home + '/gerard/data/confocal'
+    if server:
+        base_dir = home + '/gerard/ITB/home/data/confocal'
+    else:
+        base_dir = home + '/gerard/data/confocal'
+    
     all_path = os.path.join(base_dir, f"{date}_{user}")
+    
     print(all_path)
 
     project_path = os.path.join(all_path, 'Project.lif')
