@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import platform
 
 from pathlib import Path
+from scipy.ndimage import gaussian_filter
+from skimage.restoration import richardson_lucy
 
 def loader2(date,user,split_frames=False, server=False):
     
@@ -318,6 +320,126 @@ def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=
 
 
 
+
+
+def parse_lif_psf_params(lif_path, scene=0):
+    """
+    Extract optical parameters needed for PSF computation from a Leica .lif file.
+
+    Returns
+    -------
+    dict with keys:
+        NA              : numerical aperture (float)
+        n               : refractive index of immersion medium (float)
+        voxel_z_um      : z-step size in µm (float)
+        voxel_xy_um     : lateral pixel size in µm (float)
+        emission_nm     : list of emission wavelengths per channel in nm,
+                          estimated as the midpoint of each spectral detection band
+    """
+    reader = LifReader(lif_path)
+    reader.set_scene(reader.scenes[scene])
+
+    pxsz = reader.physical_pixel_sizes
+    voxel_z_um  = float(pxsz.Z)
+    voxel_xy_um = float(pxsz.X)
+
+    NA, n = None, 1.518
+    for elem in reader.metadata.iter():
+        if 'NumericalAperture' in elem.attrib:
+            NA = float(elem.attrib['NumericalAperture'])
+            n  = float(elem.attrib.get('RefractionIndex', '1.518'))
+            break
+
+    # Each channel's emission wavelength: midpoint of its spectral detection band.
+    # MultiBand nodes repeat across series, so collect only the first occurrence per channel.
+    channel_bands = {}
+    for elem in reader.metadata.iter():
+        if elem.tag == 'MultiBand':
+            ch = int(elem.attrib['Channel'])
+            if ch not in channel_bands:
+                left  = float(elem.attrib['LeftWorld'])
+                right = float(elem.attrib['RightWorld'])
+                channel_bands[ch] = (left + right) / 2.0
+
+    emission_nm = [channel_bands[ch] for ch in sorted(channel_bands.keys())]
+
+    return {
+        'NA': NA,
+        'n': n,
+        'voxel_z_um': voxel_z_um,
+        'voxel_xy_um': voxel_xy_um,
+        'emission_nm': emission_nm,
+    }
+
+
+def _gaussian_psf_3d(sigma_xy_px, sigma_z_px):
+    """Build a normalized 3D Gaussian PSF kernel sized to 6-sigma in each dimension."""
+    def _odd_ceil(sigma):
+        s = max(3, int(np.ceil(sigma * 6)))
+        return s if s % 2 == 1 else s + 1
+
+    kz, ky, kx = _odd_ceil(sigma_z_px), _odd_ceil(sigma_xy_px), _odd_ceil(sigma_xy_px)
+    psf = np.zeros((kz, ky, kx), dtype=np.float64)
+    psf[kz // 2, ky // 2, kx // 2] = 1.0
+    psf = gaussian_filter(psf, sigma=[sigma_z_px, sigma_xy_px, sigma_xy_px])
+    return psf / psf.sum()
+
+
+def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
+    """
+    Deconvolve a ZYX confocal stack using Richardson-Lucy with a theoretical
+    Gaussian PSF derived from the microscope metadata in the .lif file.
+
+    Parameters
+    ----------
+    stack : ndarray, shape (Z, Y, X)
+        Raw confocal z-stack (any unsigned integer dtype).
+    lif_path : str
+        Path to the originating Leica .lif file.
+    channel : int
+        0-based channel index (selects the matching emission wavelength).
+    scene : int
+        Series index within the .lif file.
+    num_iter : int
+        Number of Richardson-Lucy iterations (10–30 is typical; more iterations
+        sharpen further but amplify noise).
+
+    Returns
+    -------
+    ndarray, shape (Z, Y, X), dtype float32
+        Deconvolved stack scaled back to the original intensity range.
+
+    Notes
+    -----
+    The PSF sigma values (printed on first call) depend on voxel size. With
+    coarse sampling (>0.5 µm/px), sigmas may be <1 px and the effect will be
+    subtle — most visible as reduced axial blur.
+    """
+    params = parse_lif_psf_params(lif_path, scene)
+    NA  = params['NA']
+    n   = params['n']
+    vz  = params['voxel_z_um']
+    vxy = params['voxel_xy_um']
+    lam = params['emission_nm'][channel] * 1e-3  # nm → µm
+
+    sigma_xy_um = 0.21 * lam / NA
+    sigma_z_um  = 0.66 * lam * n / (NA ** 2)
+    sigma_xy_px = sigma_xy_um / vxy
+    sigma_z_px  = sigma_z_um  / vz
+
+    print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
+          f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
+          f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px)")
+
+    psf = _gaussian_psf_3d(sigma_xy_px, sigma_z_px)
+
+    image = stack.astype(np.float64)
+    scale = image.max()
+    if scale > 0:
+        image /= scale
+
+    result = richardson_lucy(image, psf, num_iter=num_iter, clip=True)
+    return (result * scale).astype(np.float32)
 
 
 def raw_values(series_n):
