@@ -1,0 +1,15 @@
+name: leica-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - aicsimageio
+  - openjdk
+  - napari
+  - pyqt
+  - pyside2
+  - tifffile[version='<2024']
+  - matplotlib
+  - readlif
+prefix: /Users/gerard/miniforge3/envs/leica-env
