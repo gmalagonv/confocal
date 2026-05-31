@@ -320,6 +320,10 @@ def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=
 
 
 
+######################################## deconvolution
+
+
+
 
 
 def parse_lif_psf_params(lif_path, scene=0):
@@ -340,15 +344,17 @@ def parse_lif_psf_params(lif_path, scene=0):
     reader.set_scene(reader.scenes[scene])
 
     pxsz = reader.physical_pixel_sizes
-    voxel_z_um  = float(pxsz.Z)
-    voxel_xy_um = float(pxsz.X)
+    voxel_z_um  = abs(float(pxsz.Z))
+    voxel_xy_um = abs(float(pxsz.X))
 
     NA, n = None, 1.518
     for elem in reader.metadata.iter():
         if 'NumericalAperture' in elem.attrib:
+            #print('here')
             NA = float(elem.attrib['NumericalAperture'])
             n  = float(elem.attrib.get('RefractionIndex', '1.518'))
             break
+
 
     # Each channel's emission wavelength: midpoint of its spectral detection band.
     # MultiBand nodes repeat across series, so collect only the first occurrence per channel.
@@ -439,8 +445,15 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
         image /= scale
 
     result = richardson_lucy(image, psf, num_iter=num_iter, clip=True)
-    return (result * scale).astype(np.float32)
+    result = (result * scale).astype(np.float32)
+    
+    imwrite('deconv_ch0.tif', result, imagej=True, resolution=(1/vxy, 1/vxy),
+        metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+    
+    # return (result * scale).astype(np.float32)
+    return result
 
+################################
 
 def raw_values(series_n):
     
