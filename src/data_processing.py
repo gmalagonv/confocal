@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import platform
 
 from pathlib import Path
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, median_filter
 from skimage.restoration import richardson_lucy
 
 def loader2(date,user,split_frames=False, server=False):
@@ -378,28 +378,34 @@ def parse_lif_psf_params(lif_path, scene=0):
     }
 
 
-def _gaussian_psf_3d(sigma_xy_px, sigma_z_px):
-    """Build a normalized 3D Gaussian PSF kernel sized to 6-sigma in each dimension."""
+def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
+    """Build a normalized Gaussian PSF kernel. 3D if sigma_z_px is given, else 2D."""
     def _odd_ceil(sigma):
         s = max(3, int(np.ceil(sigma * 6)))
         return s if s % 2 == 1 else s + 1
 
-    kz, ky, kx = _odd_ceil(sigma_z_px), _odd_ceil(sigma_xy_px), _odd_ceil(sigma_xy_px)
-    psf = np.zeros((kz, ky, kx), dtype=np.float64)
-    psf[kz // 2, ky // 2, kx // 2] = 1.0
-    psf = gaussian_filter(psf, sigma=[sigma_z_px, sigma_xy_px, sigma_xy_px])
+    if sigma_z_px is not None:
+        kz, ky, kx = _odd_ceil(sigma_z_px), _odd_ceil(sigma_xy_px), _odd_ceil(sigma_xy_px)
+        psf = np.zeros((kz, ky, kx), dtype=np.float64)
+        psf[kz // 2, ky // 2, kx // 2] = 1.0
+        psf = gaussian_filter(psf, sigma=[sigma_z_px, sigma_xy_px, sigma_xy_px])
+    else:
+        ky, kx = _odd_ceil(sigma_xy_px), _odd_ceil(sigma_xy_px)
+        psf = np.zeros((ky, kx), dtype=np.float64)
+        psf[ky // 2, kx // 2] = 1.0
+        psf = gaussian_filter(psf, sigma=[sigma_xy_px, sigma_xy_px])
     return psf / psf.sum()
 
 
 def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
     """
-    Deconvolve a ZYX confocal stack using Richardson-Lucy with a theoretical
+    Deconvolve a confocal image using Richardson-Lucy with a theoretical
     Gaussian PSF derived from the microscope metadata in the .lif file.
 
     Parameters
     ----------
-    stack : ndarray, shape (Z, Y, X)
-        Raw confocal z-stack (any unsigned integer dtype).
+    stack : ndarray, shape (Z, Y, X) or (Y, X)
+        Raw confocal z-stack or single 2D frame (any unsigned integer dtype).
     lif_path : str
         Path to the originating Leica .lif file.
     channel : int
@@ -412,8 +418,8 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
 
     Returns
     -------
-    ndarray, shape (Z, Y, X), dtype float32
-        Deconvolved stack scaled back to the original intensity range.
+    ndarray, same shape as stack, dtype float32
+        Deconvolved image scaled back to the original intensity range.
 
     Notes
     -----
@@ -433,22 +439,42 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
     sigma_xy_px = sigma_xy_um / vxy
     sigma_z_px  = sigma_z_um  / vz
 
-    print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
-          f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
-          f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px)")
-
-    psf = _gaussian_psf_3d(sigma_xy_px, sigma_z_px)
+    is_3d = stack.ndim == 3
+    if is_3d:
+        print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
+              f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
+              f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px)")
+        psf = _gaussian_psf(sigma_xy_px, sigma_z_px)
+    else:
+        print(f"PSF 2D (ch{channel}): λ={lam*1e3:.0f} nm | "
+              f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px)")
+        psf = _gaussian_psf(sigma_xy_px)
 
     image = stack.astype(np.float64)
+    # Replace only pixels that deviate strongly from their local median (hot pixels).
+    # This avoids the striping artifact caused by blanket median filtering.
+    # image = median_filter(image, size = 3)
+    local_median = median_filter(image, size=3)
+    hot_pixels = (image - local_median) > (5.0 * image.std())
+    image[hot_pixels] = local_median[hot_pixels]
     scale = image.max()
     if scale > 0:
         image /= scale
 
     result = richardson_lucy(image, psf, num_iter=num_iter, clip=True)
     result = (result * scale).astype(np.float32)
+    # path deconv image:
+    name2remove = lif_path.split('/')[-1]
+    glob_path = lif_path.replace('/' + name2remove, '')
+    #new_name = glob_path + 'series_'+ str(scene) +'/'+'channel_'+ str(channel)+'/'+'deconv.tif'
+    name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'
+    print(name)
+    final_path = os.path.join(glob_path, 'series_'+ str(scene),'channel_'+ str(channel), name)
+
     
-    imwrite('deconv_ch0.tif', result, imagej=True, resolution=(1/vxy, 1/vxy),
-        metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+    axes = 'ZYX' if is_3d else 'YX'
+    imwrite(final_path, result, imagej=True, resolution=(1/vxy, 1/vxy),
+        metadata={'spacing': vz, 'unit': 'um', 'axes': axes})
     
     # return (result * scale).astype(np.float32)
     return result
