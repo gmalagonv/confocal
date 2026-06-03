@@ -43,13 +43,14 @@ On Linux (server): same environment name, activated normally via `conda activate
 | `signal_extractor(mask_path, file_path, ...)` | Extract mean intensity per ROI per Z-frame |
 | `signals(date, user, series_n, masks_suffixes, ...)` | Batch signal extraction for multiple masks/channels |
 | `parse_lif_psf_params(lif_path, scene)` | Read NA, voxel sizes, emission wavelengths from `.lif` metadata |
-| `deconvolve(stack, lif_path, channel, scene, num_iter)` | Richardson-Lucy deconvolution with metadata-derived PSF |
+| `deconvolve(stack, lif_path, channel, scene, num_iter)` | Richardson-Lucy deconvolution; auto-selects 3D or 2D-per-frame based on Nyquist |
 | `plot_bars_with_sem3(groups, labels, ...)` | Bar plot with SEM and overlaid data points |
 
 ## Deconvolution
 - Algorithm: Richardson-Lucy (`skimage.restoration.richardson_lucy`)
-- PSF: 3D (or 2D for single frames) Gaussian, parameters derived from `.lif` metadata
+- PSF: Gaussian, parameters derived from `.lif` metadata
 - PSF formulas: `σ_xy = 0.21 × λ / NA`, `σ_z = 0.66 × λ × n / NA²`
+- **Nyquist-based mode selection** (automatic): if `σ_z_px ≥ 2` → 3D deconvolution; if `σ_z_px < 2` (Z undersampled) → 2D Richardson-Lucy applied per frame using XY PSF only. Nyquist criterion: pixel ≤ σ/2, i.e. σ/pixel ≥ 2.
 - Hot pixel removal: selective median filter (only replaces pixels > 5× std above local median)
 - Output: `float32`, saved as ImageJ-compatible TIFF with voxel size metadata
 - Accepts both full ZYX stacks and single 2D frames
@@ -60,7 +61,7 @@ On Linux (server): same environment name, activated normally via `conda activate
 - NA = 1.3, n = 1.518 (oil)
 - Voxel size: Z = 1.0 µm, XY = 0.71 µm
 - Channels: Ch0 ~529 nm (BRP), Ch1 ~659 nm (mito), Ch2 ~775 nm (HSP)
-- Images are coarsely sampled (~7× below Nyquist in XY) → deconvolution effect is subtle
+- Images are coarsely sampled (~7× below Nyquist in XY) → σ_xy_px ≈ 0.12, deconvolution effect is subtle; σ_z_px ≈ 0.44 → 2D-per-frame mode will be selected automatically
 
 ## Analysis notebooks
 - `analysis_notebooks/` — one notebook per imaging session date (format `YY_MM_DD.ipynb`)

@@ -44,12 +44,18 @@ def loader2(date,user,split_frames=False, server=False):
         print(f"series {i}: shape = {reader.dims.shape}")
         num_channels = reader.dims.C 
         
+        pxsz = reader.physical_pixel_sizes
+        vxy = abs(float(pxsz.X))
+        vz  = abs(float(pxsz.Z))
+
         for channel in range(0,num_channels):
 
             if split_frames == False:
                 zyx = reader.get_image_data("ZYX", T=0, C=channel)
                 name_c = f"{date}_s{i}_ch{channel}.tif"
-                imwrite(os.path.join(series_path, name_c), zyx)
+                imwrite(os.path.join(series_path, name_c), zyx,
+                        imagej=True, resolution=(1/vxy, 1/vxy),
+                        metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
             else:
                 channel_path = os.path.join(series_path,f"channel_{channel}" )
                 os.makedirs(channel_path, exist_ok=True)
@@ -57,7 +63,9 @@ def loader2(date,user,split_frames=False, server=False):
                 for frame in range(0,num_frames):
                     yx = reader.get_image_data("YX", T=0, C=channel, Z=frame)
                     name_f = f"{date}_s{i}_ch{channel}_f{frame}.tif"
-                    imwrite(os.path.join(channel_path, name_f), yx)
+                    imwrite(os.path.join(channel_path, name_f), yx,
+                            imagej=True, resolution=(1/vxy, 1/vxy),
+                            metadata={'unit': 'um', 'axes': 'YX'})
                     
 def signal_extractor(mask_file_path, file_path, force_one_roi= False, print_area = False, Messages=False):
     """
@@ -337,8 +345,10 @@ def parse_lif_psf_params(lif_path, scene=0):
         n               : refractive index of immersion medium (float)
         voxel_z_um      : z-step size in µm (float)
         voxel_xy_um     : lateral pixel size in µm (float)
-        emission_nm     : list of emission wavelengths per channel in nm,
-                          estimated as the midpoint of each spectral detection band
+        emission_nm     : list of emission wavelengths per channel in nm.
+                          Uses the known fluorophore emission peak when the
+                          DyeName field is set in the .lif metadata; falls back
+                          to the midpoint of the spectral detection band otherwise.
     """
     reader = LifReader(lif_path)
     reader.set_scene(reader.scenes[scene])
@@ -356,18 +366,87 @@ def parse_lif_psf_params(lif_path, scene=0):
             break
 
 
-    # Each channel's emission wavelength: midpoint of its spectral detection band.
-    # MultiBand nodes repeat across series, so collect only the first occurrence per channel.
-    channel_bands = {}
-    for elem in reader.metadata.iter():
-        if elem.tag == 'MultiBand':
-            ch = int(elem.attrib['Channel'])
-            if ch not in channel_bands:
-                left  = float(elem.attrib['LeftWorld'])
-                right = float(elem.attrib['RightWorld'])
-                channel_bands[ch] = (left + right) / 2.0
+    # Known fluorophore emission peaks (nm). Used when Leica's DyeName field is set.
+    # Falls back to detection-band midpoint when DyeName is absent or unrecognised.
+    _dye_emission = {
+        'Leica/ALEXA 405':  430,
+        'Leica/ALEXA 488':  519,
+        'Leica/ALEXA 546':  573,
+        'Leica/ALEXA 555':  565,
+        'Leica/ALEXA 568':  603,
+        'Leica/ALEXA 594':  617,
+        'Leica/ALEXA 633':  647,
+        'Leica/ALEXA 647':  668,
+        'Leica/ALEXA 680':  702,
+        'Leica/ALEXA 750':  779,
+        'Leica/Cy3':        570,
+        'Leica/Cy5':        670,
+        'Leica/Cy7':        800,
+        'Leica/FITC':       519,
+        'Leica/TRITC':      573,
+    }
 
-    emission_nm = [channel_bands[ch] for ch in sorted(channel_bands.keys())]
+    # Build emission_nm by parsing each ATLConfocalSettingDefinition block (one per
+    # acquisition sequence) rather than flattening the whole tree. This correctly
+    # handles sequential acquisitions where the same detector channel number is reused
+    # across sequences for different dyes.
+    #
+    # Channel ordering: sort sequences by minimum active laser wavelength, then within
+    # each sequence sort by detector channel number. This matches how LifReader assigns
+    # image channel indices for sequential acquisitions.
+    #
+    # Blocks with >2 simultaneous lasers are skipped (live-view / alignment scans).
+    sequences = []
+    seen_configs = set()
+
+    for block in reader.metadata.iter('ATLConfocalSettingDefinition'):
+        active_lasers = [
+            int(e.attrib['LaserLine'])
+            for e in block.iter('LaserLineSetting')
+            if float(e.attrib.get('IntensityDev', '0')) > 0
+        ]
+        if not active_lasers or len(active_lasers) > 2:
+            continue
+
+        active_det_chs = {
+            int(e.attrib['Channel'])
+            for e in block.iter('Detector')
+            if e.attrib.get('IsActive') == '1' and e.attrib.get('ScanType') == 'Internal'
+        }
+        if not active_det_chs:
+            continue
+
+        chan_emission = {}
+        for mb in block.iter('MultiBand'):
+            ch = int(mb.attrib['Channel'])
+            if ch not in active_det_chs:
+                continue
+            dye = mb.attrib.get('DyeName', '')
+            if dye in _dye_emission:
+                chan_emission[ch] = _dye_emission[dye]
+            else:
+                left  = float(mb.attrib['LeftWorld'])
+                right = float(mb.attrib['RightWorld'])
+                chan_emission[ch] = (left + right) / 2.0
+
+        if not chan_emission:
+            continue
+
+        # Deduplicate: same dye/band configuration appears once per series
+        config_key = frozenset(chan_emission.items())
+        if config_key in seen_configs:
+            continue
+        seen_configs.add(config_key)
+
+        sequences.append({'min_laser': min(active_lasers), 'channels': chan_emission})
+
+    # Sort sequences by minimum active laser wavelength, then flatten
+    sequences.sort(key=lambda s: s['min_laser'])
+    emission_nm = [
+        em
+        for seq in sequences
+        for _, em in sorted(seq['channels'].items())
+    ]
 
     return {
         'NA': NA,
@@ -397,7 +476,7 @@ def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
     return psf / psf.sum()
 
 
-def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
+def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None):
     """
     Deconvolve a confocal image using Richardson-Lucy with a theoretical
     Gaussian PSF derived from the microscope metadata in the .lif file.
@@ -415,6 +494,11 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
     num_iter : int
         Number of Richardson-Lucy iterations (10–30 is typical; more iterations
         sharpen further but amplify noise).
+    emission_nm : float or None
+        Known fluorophore emission peak in nm. If provided, overrides the
+        detection-band midpoint read from the .lif metadata (which can be
+        significantly off for wide detection windows). E.g. 519 for Alexa 488,
+        573 for Alexa 546, 670 for Cy5.
 
     Returns
     -------
@@ -423,16 +507,20 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
 
     Notes
     -----
-    The PSF sigma values (printed on first call) depend on voxel size. With
-    coarse sampling (>0.5 µm/px), sigmas may be <1 px and the effect will be
-    subtle — most visible as reduced axial blur.
+    Automatically selects 3D or 2D-per-frame deconvolution based on Nyquist:
+    if σ_z < 2 px (Z undersampled, pixel > σ_z/2), applies 2D RL to each
+    frame independently using only the XY PSF.
+    With coarse XY sampling (>0.5 µm/px), σ_xy may be <1 px and the effect
+    will be subtle — most visible as reduced lateral blur.
     """
     params = parse_lif_psf_params(lif_path, scene)
     NA  = params['NA']
     n   = params['n']
     vz  = params['voxel_z_um']
     vxy = params['voxel_xy_um']
-    lam = params['emission_nm'][channel] * 1e-3  # nm → µm
+    # Use known fluorophore emission peak if provided, else fall back to
+    # detection-band midpoint from metadata (can be ~15-20% off for wide windows).
+    lam = (emission_nm if emission_nm is not None else params['emission_nm'][channel]) * 1e-3  # nm → µm
 
     sigma_xy_um = 0.21 * lam / NA
     sigma_z_um  = 0.66 * lam * n / (NA ** 2)
@@ -440,29 +528,40 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
     sigma_z_px  = sigma_z_um  / vz
 
     is_3d = stack.ndim == 3
+    # Nyquist: need σ ≥ 2 px (pixel ≤ σ/2) for the axis to be adequately sampled.
+    # If Z is undersampled, fall back to 2D deconvolution applied per frame.
+    use_3d_psf = is_3d and (sigma_z_px >= 2.0)
+
     if is_3d:
+        mode = '3D' if use_3d_psf else f'2D-per-frame (σ_z={sigma_z_px:.2f} px < 2, Z undersampled)'
         print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
-              f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px)")
-        psf = _gaussian_psf(sigma_xy_px, sigma_z_px)
+              f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
+        psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
     else:
         print(f"PSF 2D (ch{channel}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px)")
         psf = _gaussian_psf(sigma_xy_px)
 
-    image = stack.astype(np.float64)
-    # Replace only pixels that deviate strongly from their local median (hot pixels).
-    # This avoids the striping artifact caused by blanket median filtering.
-    # image = median_filter(image, size = 3)
-    local_median = median_filter(image, size=3)
-    hot_pixels = (image - local_median) > (5.0 * image.std())
-    image[hot_pixels] = local_median[hot_pixels]
-    scale = image.max()
-    if scale > 0:
-        image /= scale
+    def _process(img):
+        img = img.astype(np.float64)
+        # Replace only pixels that deviate strongly from their local median (hot pixels).
+        # This avoids the striping artifact caused by blanket median filtering.
+        # img = median_filter(img, size=3)
+        local_median = median_filter(img, size=3)
+        hot_pixels = (img - local_median) > (5.0 * img.std())
+        img[hot_pixels] = local_median[hot_pixels]
+        scale = img.max()
+        if scale > 0:
+            img /= scale
+        out = richardson_lucy(img, psf, num_iter=num_iter, clip=True)
+        return (out * scale).astype(np.float32)
 
-    result = richardson_lucy(image, psf, num_iter=num_iter, clip=True)
-    result = (result * scale).astype(np.float32)
+    if is_3d and not use_3d_psf:
+        result = np.stack([_process(stack[z]) for z in range(stack.shape[0])])
+    else:
+        result = _process(stack)
+
     # path deconv image:
     name2remove = lif_path.split('/')[-1]
     glob_path = lif_path.replace('/' + name2remove, '')
@@ -471,13 +570,12 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15):
     print(name)
     final_path = os.path.join(glob_path, 'series_'+ str(scene),'channel_'+ str(channel), name)
 
-    
     axes = 'ZYX' if is_3d else 'YX'
     imwrite(final_path, result, imagej=True, resolution=(1/vxy, 1/vxy),
         metadata={'spacing': vz, 'unit': 'um', 'axes': axes})
-    
+
     # return (result * scale).astype(np.float32)
-    return result
+    return result, sigma_xy_px
 
 ################################
 
