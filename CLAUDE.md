@@ -75,14 +75,36 @@ Re-blur the deconvolved result with `gaussian_filter(result[z], sigma=sigma_xy_p
 - Images are coarsely sampled (~7× below Nyquist in XY) → σ_xy_px ≈ 0.12, deconvolution effect is subtle; σ_z_px ≈ 0.44 → 2D-per-frame mode will be selected automatically
 
 ### Known microscope parameters (2026-05-26 dataset)
-- Objective: HC PL APO CS2 40x/1.40 OIL (NA = 1.4, different from 2025-11-29)
+- Objective: HC PL APO CS2 **63x/1.40 OIL** (NA = 1.4, different from 2025-11-29 which was 40x/1.30)
 - NA = 1.4, n = 1.518 (oil)
-- Channels: Ch0 ~529 nm (BRP), Ch1 ~659 nm (mito), Ch2 ~796.5 nm (HSP)
-- 3 series: series_0 and series_1 = 110 Z-frames, series_2 = 18 Z-frames
-- Scene 0 voxel size: Z = 0.534 µm, XY = 0.361 µm
-- Scene 1 voxel size: Z = 0.292 µm, XY = 0.023 µm (fine XY zoom)
-- Scene 2 voxel size: Z = 0.661 µm, XY = 0.023 µm
+- Antibodies: Alexa 488 (BRP), Alexa 546 (mitochondria), Cy5 (HSP70)
+
+| Scene index | Scene name | Z-frames | XY (µm/px) | Z (µm/step) | Notes |
+|---|---|---|---|---|---|
+| 0 | `1zoom_all` | 110 | 0.361 | 0.534 | 1× digital zoom — coarse XY, σ_xy ≈ 0.22 px (below Nyquist) |
+| 1 | `16zoom_vac` | 110 | 0.023 | 0.292 | 16× digital zoom — well sampled XY, σ_xy ≈ 3.5 px |
+| 2 | `16zoom_a3` | 18 | 0.023 | 0.661 | 16× zoom, α3 subregion only |
+
 - All scenes → σ_z_px < 2 → 2D-per-frame deconvolution is selected automatically
+- Scene 0 is coarsely sampled in XY (same situation as 2025-11-29 dataset); deconvolution has negligible effect
+- Scenes 1 and 2 are well sampled in XY; deconvolution is meaningful
+
+#### Acquisition structure (from .lif metadata `ATLConfocalSettingDefinition` blocks)
+Sequential acquisition with two sequences per Z-stack:
+
+| Sequence | Active lasers | Detector | Detection band | Dye | Image channel |
+|---|---|---|---|---|---|
+| Seq 1 (sequential) | 552 nm only | PMT2 | 557–761 nm | Alexa 546 | ch2 |
+| Seq 2 (simultaneous) | 488 + 638 nm | PMT1 | 501–610 nm | Alexa 488 | ch0 |
+| Seq 2 (simultaneous) | 488 + 638 nm | PMT2 | 643–788 nm | Cy5 | ch1 |
+
+**ch0 (BRP/Alexa 488) and ch1 (HSP70/Cy5) are acquired simultaneously in Seq 2; ch2 (Mito/Alexa 546) is acquired separately in Seq 1.**
+
+#### Spectral bleed-through
+Determined by cross-referencing active lasers with detection bands:
+- **Alexa 546 → ch0 (BRP channel)**: During Seq 2, the 488 nm laser cross-excites Alexa 546 (~5–15% efficiency). Alexa 546 emits at 573 nm, which falls within the ch0 detection band (501–610 nm). **Mitochondria (Alexa 546) bleed into the BRP channel.** This should be considered when interpreting BRP signals.
+- **ch1 ↔ ch2 (Mito/HSP70 pair)**: Clean — acquired in separate sequences with non-overlapping excitation. No significant bleed-through. This pair is suitable for colocalization analysis.
+- Bleed-through was identified by parsing `ATLConfocalSettingDefinition` XML blocks from the `.lif` file and checking whether emission peaks of non-target dyes fall within each detector's active wavelength band.
 
 ## Analysis notebooks
 - `analysis_notebooks/` — one notebook per imaging session date (format `YY_MM_DD.ipynb`)

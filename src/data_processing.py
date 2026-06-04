@@ -461,6 +461,222 @@ def parse_lif_psf_params(lif_path, scene=0):
     }
 
 
+def describe_acquisition(lif_path):
+    """
+    Parse a Leica .lif file and print a per-scene summary of acquisition
+    parameters: objective, sequential acquisition structure, per-channel PSF
+    parameters, Nyquist status, and spectral bleed-through risks.
+
+    Returns
+    -------
+    dict keyed by scene name.  Each value contains:
+        objective, NA, n, voxel_xy_um, voxel_z_um, shape_zyx,
+        sequences      -- list of {lasers, channels} dicts
+        image_channels -- list of per-channel PSF/Nyquist dicts (0-indexed)
+        bleed_through  -- list of bleed-through warning dicts
+    """
+    _dye_emission = {
+        'Leica/ALEXA 405': 430, 'Leica/ALEXA 488': 519, 'Leica/ALEXA 546': 573,
+        'Leica/ALEXA 555': 565, 'Leica/ALEXA 568': 603, 'Leica/ALEXA 594': 617,
+        'Leica/ALEXA 633': 647, 'Leica/ALEXA 647': 668, 'Leica/ALEXA 680': 702,
+        'Leica/ALEXA 750': 779, 'Leica/Cy3': 570, 'Leica/Cy5': 670,
+        'Leica/Cy7': 800, 'Leica/FITC': 519, 'Leica/TRITC': 573,
+    }
+    _dye_excitation = {
+        'Leica/ALEXA 405': 402, 'Leica/ALEXA 488': 495, 'Leica/ALEXA 546': 556,
+        'Leica/ALEXA 555': 555, 'Leica/ALEXA 568': 578, 'Leica/ALEXA 594': 590,
+        'Leica/ALEXA 633': 632, 'Leica/ALEXA 647': 650, 'Leica/ALEXA 680': 679,
+        'Leica/ALEXA 750': 749, 'Leica/Cy3': 550, 'Leica/Cy5': 649,
+        'Leica/Cy7': 743, 'Leica/FITC': 495, 'Leica/TRITC': 547,
+    }
+
+    scene_names = LifReader(lif_path).scenes
+    all_scenes = {}
+
+    for scene_idx, scene_name in enumerate(scene_names):
+        # Fresh reader per scene — avoids physical_pixel_sizes caching across scenes
+        reader = LifReader(lif_path)
+        reader.set_scene(scene_name)
+
+        pxsz = reader.physical_pixel_sizes
+        vxy = abs(float(pxsz.X))
+        vz  = abs(float(pxsz.Z))
+        nz, ny, nx = reader.dims.Z, reader.dims.Y, reader.dims.X
+
+        obj_name, NA, n = 'unknown', 1.4, 1.518
+        for elem in reader.metadata.iter():
+            if 'NumericalAperture' in elem.attrib:
+                NA = float(elem.attrib['NumericalAperture'])
+                n  = float(elem.attrib.get('RefractionIndex', '1.518'))
+                obj_name = elem.attrib.get('ObjectiveName', 'unknown').strip()
+                break
+
+        # Parse unique acquisition sequences (same logic as parse_lif_psf_params)
+        sequences = []
+        seen_configs = set()
+        for block in reader.metadata.iter('ATLConfocalSettingDefinition'):
+            active_lasers = sorted([
+                int(e.attrib['LaserLine'])
+                for e in block.iter('LaserLineSetting')
+                if float(e.attrib.get('IntensityDev', '0')) > 0
+            ])
+            if not active_lasers or len(active_lasers) > 2:
+                continue
+            active_det_chs = {
+                int(e.attrib['Channel'])
+                for e in block.iter('Detector')
+                if e.attrib.get('IsActive') == '1' and e.attrib.get('ScanType') == 'Internal'
+            }
+            if not active_det_chs:
+                continue
+            seq_chs = []
+            for mb in block.iter('MultiBand'):
+                ch = int(mb.attrib['Channel'])
+                if ch not in active_det_chs:
+                    continue
+                dye  = mb.attrib.get('DyeName', '')
+                left  = float(mb.attrib['LeftWorld'])
+                right = float(mb.attrib['RightWorld'])
+                em = _dye_emission.get(dye, (left + right) / 2.0)
+                seq_chs.append({'detector_ch': ch, 'band_nm': (left, right),
+                                 'dye_name': dye, 'emission_nm': em})
+            if not seq_chs:
+                continue
+            config_key = frozenset((c['detector_ch'], c['emission_nm']) for c in seq_chs)
+            if config_key in seen_configs:
+                continue
+            seen_configs.add(config_key)
+            sequences.append({
+                'lasers': active_lasers,
+                'channels': sorted(seq_chs, key=lambda c: c['detector_ch']),
+            })
+        sequences.sort(key=lambda s: min(s['lasers']))
+
+        # Build image_channels with PSF + Nyquist info (ordered by acquisition sequence)
+        image_channels = []
+        for seq in sequences:
+            for ch in seq['channels']:
+                lam    = ch['emission_nm'] * 1e-3  # nm → µm
+                sxy_um = 0.21 * lam / NA
+                sz_um  = 0.66 * lam * n / NA ** 2
+                sxy_px = sxy_um / vxy
+                sz_px  = sz_um  / vz
+                image_channels.append({
+                    'index':               len(image_channels),
+                    'dye':                 ch['dye_name'],
+                    'emission_nm':         ch['emission_nm'],
+                    'band_nm':             ch['band_nm'],
+                    'acquired_with_lasers': seq['lasers'],
+                    'sigma_xy_um':         round(sxy_um, 4),
+                    'sigma_xy_px':         round(sxy_px, 3),
+                    'sigma_z_um':          round(sz_um, 4),
+                    'sigma_z_px':          round(sz_px, 3),
+                    'nyquist_xy':          sxy_px >= 2.0,
+                    'nyquist_z':           sz_px  >= 2.0,
+                    'deconv_mode':         '3D' if sz_px >= 2.0 else '2D-per-frame',
+                })
+
+        # Bleed-through: for each sequence, find non-target dyes that could be
+        # cross-excited by the active laser(s) and emit into an active detector band.
+        # Flag only when laser is bluer than the dye's excitation peak by up to 100 nm,
+        # or redder by up to 30 nm (absorption tail is negligible beyond +30 nm).
+        all_named_dyes = {
+            c['dye_name']: _dye_emission[c['dye_name']]
+            for seq in sequences for c in seq['channels']
+            if c['dye_name'] in _dye_emission
+        }
+        bleed_through = []
+        for seq in sequences:
+            target_dyes = {c['dye_name'] for c in seq['channels']}
+            for laser in seq['lasers']:
+                for dye, em_nm in all_named_dyes.items():
+                    if dye in target_dyes:
+                        continue
+                    ex_peak = _dye_excitation.get(dye)
+                    if ex_peak is None:
+                        continue
+                    delta = laser - ex_peak  # negative: laser bluer than peak
+                    if delta > 30 or delta < -100:
+                        continue  # outside plausible cross-excitation range
+                    for det_ch in seq['channels']:
+                        bl, br = det_ch['band_nm']
+                        if bl <= em_nm <= br:
+                            severity = ('HIGH'   if abs(delta) < 30  else
+                                        'MEDIUM' if abs(delta) < 70  else 'LOW')
+                            tgt_idx = next((ic['index'] for ic in image_channels
+                                            if ic['band_nm'] == det_ch['band_nm']), '?')
+                            bleed_through.append({
+                                'source_dye':                  dye,
+                                'source_emission_nm':          em_nm,
+                                'source_excitation_peak_nm':   ex_peak,
+                                'cross_excitation_laser_nm':   laser,
+                                'delta_laser_to_peak_nm':      delta,
+                                'target_channel_index':        tgt_idx,
+                                'target_channel_dye':          det_ch['dye_name'],
+                                'target_band_nm':              (bl, br),
+                                'severity':                    severity,
+                            })
+
+        scene_data = {
+            'scene_name':    scene_name,
+            'objective':     obj_name,
+            'NA':            NA,
+            'n':             n,
+            'voxel_xy_um':   vxy,
+            'voxel_z_um':    vz,
+            'shape_zyx':     (nz, ny, nx),
+            'sequences':     sequences,
+            'image_channels': image_channels,
+            'bleed_through': bleed_through,
+        }
+        all_scenes[scene_name] = scene_data
+
+        # ── printed summary ────────────────────────────────────────────────────
+        W = 62
+        print(f'\n{"═"*W}')
+        print(f'Scene {scene_idx}: {scene_name}')
+        print('═'*W)
+        print(f'  Objective  : {obj_name}')
+        print(f'  NA / n     : {NA} / {n}')
+        print(f'  Voxel size : XY = {vxy:.4f} µm/px  |  Z = {vz:.4f} µm/step')
+        print(f'  Shape      : {nz} × {ny} × {nx}  (Z × Y × X)')
+
+        print(f'\n  {"─"*38} Acquisition sequences')
+        for s_i, seq in enumerate(sequences):
+            laser_str = ' + '.join(f'{l} nm' for l in seq['lasers'])
+            tag = '  [simultaneous]' if len(seq['lasers']) > 1 else ''
+            print(f'  Seq {s_i+1}  laser(s): {laser_str}{tag}')
+            for ch in seq['channels']:
+                dye_str = ch['dye_name'] if ch['dye_name'] else '(unnamed)'
+                print(f'         det ch{ch["detector_ch"]}  '
+                      f'{ch["band_nm"][0]:.0f}–{ch["band_nm"][1]:.0f} nm  '
+                      f'{dye_str:<22}  em = {ch["emission_nm"]:.0f} nm')
+
+        print(f'\n  {"─"*38} Image channels (0-indexed)')
+        for ic in image_channels:
+            dye_str  = ic['dye'] if ic['dye'] else '(unnamed)'
+            nxy = '✓' if ic['nyquist_xy'] else '✗ sub-Nyquist'
+            nz_ = '✓' if ic['nyquist_z']  else '✗ sub-Nyquist'
+            print(f'  ch{ic["index"]}  {dye_str:<22}  em={ic["emission_nm"]:.0f} nm  '
+                  f'σ_xy={ic["sigma_xy_px"]:.2f}px ({ic["sigma_xy_um"]:.3f}µm) [{nxy}]  '
+                  f'σ_z={ic["sigma_z_px"]:.2f}px [{nz_}]  → {ic["deconv_mode"]}')
+
+        print(f'\n  {"─"*38} Spectral bleed-through')
+        if bleed_through:
+            for bt in bleed_through:
+                print(f'  ⚠  [{bt["severity"]}]  {bt["source_dye"]}  →  '
+                      f'ch{bt["target_channel_index"]} ({bt["target_channel_dye"]})')
+                print(f'       {bt["cross_excitation_laser_nm"]} nm laser cross-excites '
+                      f'{bt["source_dye"]} (ex peak {bt["source_excitation_peak_nm"]} nm, '
+                      f'Δ={bt["delta_laser_to_peak_nm"]:+d} nm)')
+                print(f'       emission at {bt["source_emission_nm"]} nm falls in detection '
+                      f'band {bt["target_band_nm"][0]:.0f}–{bt["target_band_nm"][1]:.0f} nm')
+        else:
+            print('  None detected.')
+
+    return all_scenes
+
+
 def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
     """Build a normalized Gaussian PSF kernel. 3D if sigma_z_px is given, else 2D."""
     def _odd_ceil(sigma):
@@ -567,10 +783,19 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None)
         result = _process(stack)
 
     # path deconv image:
+    #'gerard/data/confocal/2026_05_26_Gerardo/Project.lif'
     name2remove = lif_path.split('/')[-1]
     glob_path = lif_path.replace('/' + name2remove, '')
+    date = (lif_path.split('/')[-2])
+    date = date.replace(date.split('_')[-1], '') # 2026_05_26_
+    
+    #print(date, '<-----------')
     #new_name = glob_path + 'series_'+ str(scene) +'/'+'channel_'+ str(channel)+'/'+'deconv.tif'
-    name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'
+    #name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'    #'s1_ch0_deconv_iter_4.tif
+
+    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
+    
+
     print(name)
     final_path = os.path.join(glob_path, 'series_'+ str(scene),'channel_'+ str(channel), name)
 
