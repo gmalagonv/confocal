@@ -142,14 +142,39 @@ Target dataset: **2026_05_26_Gerardo** (no hand-drawn ROIs available — masks a
 Primary channel pair: **Ch1 (Mito) ↔ Ch2 (HSP70)**. Other pairs (Ch0↔Ch1, Ch0↔Ch2) may follow the same workflow.
 
 ### Step 1 — Generate a foreground mask via thresholding
-No Fiji-drawn ROI masks exist for this dataset. Use Otsu thresholding on each channel to define foreground, then take the union as the analysis region:
+No Fiji-drawn ROI masks exist for this dataset. Use thresholding on each channel to define foreground, then take the union as the analysis region.
+
+**You do not need to use the same algorithm for every channel.** Choose based on each channel's histogram shape.
+
+#### Algorithm options
+
+| Algorithm | `skimage` function | Best when |
+|---|---|---|
+| Otsu | `threshold_otsu` | Histogram is clearly bimodal (distinct foreground/background) |
+| Li (min. cross-entropy) | `threshold_li` | Foreground is sparse — Otsu pulls threshold too low because background dominates |
+| Fixed percentile | `np.percentile(img, p)` | Need consistency across samples regardless of histogram shape |
+
+**Li (minimum cross-entropy):** finds threshold `t` minimising `Σ_{i≤t}[i·log(i/μ_bg)] + Σ_{i>t}[i·log(i/μ_fg)]`. Less sensitive to class imbalance than Otsu — tends to place threshold closer to foreground mean, better for sparse bright structures like HSP70 puncta.
 
 ```python
-from skimage.filters import threshold_otsu
+from skimage.filters import threshold_otsu, threshold_li
 
-thresh1 = threshold_otsu(ch1)
-thresh2 = threshold_otsu(ch2)
+# Start with Otsu on both; switch Li for a channel if mask looks over/under-segmented
+thresh1 = threshold_otsu(ch1)   # or threshold_li(ch1)
+thresh2 = threshold_otsu(ch2)   # or threshold_li(ch2)
 mask = (ch1 > thresh1) | (ch2 > thresh2)  # union: anywhere either signal is present
+```
+
+**Visual check before committing to an algorithm:**
+```python
+import matplotlib.pyplot as plt
+
+for img, name in [(ch1, 'Ch1 Mito'), (ch2, 'Ch2 HSP70')]:
+    plt.figure()
+    plt.hist(img.ravel(), bins=256, log=True)
+    plt.axvline(threshold_otsu(img), color='b', label='Otsu')
+    plt.axvline(threshold_li(img),   color='r', label='Li')
+    plt.title(name); plt.legend()
 ```
 
 Alternative: use only one channel's mask as reference (e.g., Mito mask to ask "within mitochondria, how much HSP70 is there?"). Choice depends on the biological question.
