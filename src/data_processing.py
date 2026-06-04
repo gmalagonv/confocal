@@ -53,7 +53,11 @@ def loader2(date,user,split_frames=False, server=False):
             if split_frames == False:
                 zyx = reader.get_image_data("ZYX", T=0, C=channel)
                 name_c = f"{date}_s{i}_ch{channel}.tif"
-                imwrite(os.path.join(series_path, name_c), zyx,
+                channel_path = os.path.join(series_path,f"channel_{channel}")
+                
+                os.makedirs(channel_path, exist_ok=True)
+                
+                imwrite(os.path.join(channel_path, name_c), zyx,
                         imagej=True, resolution=(1/vxy, 1/vxy),
                         metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
             else:
