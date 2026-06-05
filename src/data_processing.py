@@ -546,9 +546,13 @@ def describe_acquisition(lif_path):
             if config_key in seen_configs:
                 continue
             seen_configs.add(config_key)
+            pinhole_m    = float(block.attrib.get('Pinhole', 0))
+            pinhole_airy = float(block.attrib.get('PinholeAiry', 0))
             sequences.append({
-                'lasers': active_lasers,
-                'channels': sorted(seq_chs, key=lambda c: c['detector_ch']),
+                'lasers':       active_lasers,
+                'channels':     sorted(seq_chs, key=lambda c: c['detector_ch']),
+                'pinhole_um':   round(pinhole_m * 1e6, 2),
+                'pinhole_airy': round(pinhole_airy, 3),
             })
         sequences.sort(key=lambda s: min(s['lasers']))
 
@@ -646,6 +650,7 @@ def describe_acquisition(lif_path):
             laser_str = ' + '.join(f'{l} nm' for l in seq['lasers'])
             tag = '  [simultaneous]' if len(seq['lasers']) > 1 else ''
             print(f'  Seq {s_i+1}  laser(s): {laser_str}{tag}')
+            print(f'         pinhole  : {seq["pinhole_um"]:.2f} µm  ({seq["pinhole_airy"]:.3f} AU)')
             for ch in seq['channels']:
                 dye_str = ch['dye_name'] if ch['dye_name'] else '(unnamed)'
                 print(f'         det ch{ch["detector_ch"]}  '
