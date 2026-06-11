@@ -336,7 +336,170 @@ def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=
     
     
     # return results
-# COLOCALIZATION
+    
+    
+# THRESHOLDING #####################################################
+
+
+def fast_threshold_li(stack):
+    s_min, s_max = float(stack.min()), float(stack.max())
+    if s_max == s_min:
+        return s_min
+    u16 = ((stack - s_min) / (s_max - s_min) * 65535).astype(np.uint16)
+    t_u16 = threshold_li(u16)
+    return t_u16 / 65535 * (s_max - s_min) + s_min
+
+
+def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
+    
+    server = False
+    system = platform.system()
+    if system == 'Linux':
+        if server:
+            base_dir = '/home/gerard/ITB/home/data/confocal/'
+        else:
+            base_dir = '/home/gerard/data/confocal/'
+        
+    elif system == 'Darwin':
+        if server:
+            base_dir = '/Users/gerard/ITB/home/data/confocal/'
+        else:
+            base_dir = '/Users/gerard/data/confocal/'
+        
+    elif system == "Windows":
+        base_dir = 'C:/Users/cviko/data/confocal/'
+    print(base_dir + date + '_' + user + '/Project.lif')
+    info = describe_acquisition( base_dir + date + '_' + user + '/Project.lif', False)
+    
+    
+    results = {}
+    
+    treshold_algorithm_list =[
+    'triangle',
+    'otsu',
+    'yen',
+    'li',
+    ]
+    
+    
+    for series in series_list:
+        print(f'Processing series {series}---------------')
+        results['s_'+str(series)] = {}
+        
+        channel_list = list(range(len(info[list(info.keys())[series]]['image_channels']))) 
+        
+        
+        for channel in channel_list:
+            results['s_'+str(series)]['c_'+str(channel)] = {}
+            print(f'Channel {channel}************************')
+            
+            series_str = f'series_{series}'
+            channel_str = f'channel_{channel}'
+            
+            base = os.path.join(base_dir,f'{date}_{user}',f'series_{series}', f'channel_{channel}')
+            #path_series_channel = f'gerard/data/confocal/2026_05_26_Gerardo/series_{series}/channel_{channel}'#gerard/data/confocal/2026_05_26_Gerardo/Project.lif'
+            #base = home + path_series_channel #os.path.join(home, )
+            
+            path_raw        = os.path.join(base, f'{date}_s{series}_ch{channel}.tif')
+            path_raw_masks  = os.path.join(base, f'{date}_s{series}_ch{channel}_masks')
+            
+            
+            for deconv_iter in deconv_iter_list:
+            
+                
+                path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv_iter_{deconv_iter}.tif')
+                path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv_iter_{deconv_iter}_masks')
+
+                for path_in, path_out in [(path_raw, path_raw_masks), (path_deconv, path_deconv_masks)]:
+                    
+                    if 'deconv' in path_in:
+                        deconv = True
+                        key_dict = 'deconv_iter_'+str(deconv_iter)
+                    else:
+                            
+                        deconv = False
+                        key_dict = 'raw'
+                    
+                    print(key_dict, '************************')    
+                    if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
+
+                    
+                        with tiff.TiffFile(path_in) as tf:
+                            stack = tf.asarray()
+                            vxy = 1.0 / (tf.pages[0].tags['XResolution'].value[0] / tf.pages[0].tags['XResolution'].value[1])
+                            vz  = tf.imagej_metadata['spacing']
+                        
+                        #stack_proj = stack.sum(axis=0)
+                        stack_proj = stack.sum(axis=0).astype(np.float32)
+    
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack'] = stack
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack_proj'] = stack_proj
+
+                        for treshold_algorithm in treshold_algorithm_list:
+                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm] = {}
+                            
+                        
+                            if treshold_algorithm == 'triangle':
+                                thresh = threshold_triangle(stack)
+                                thresh_proj = threshold_triangle(stack_proj)
+                            elif treshold_algorithm == 'otsu':
+                                thresh = threshold_otsu(stack)
+                                thresh_proj = threshold_otsu(stack_proj)
+                            elif treshold_algorithm == 'yen':
+                                thresh = threshold_yen(stack)
+                                thresh_proj = threshold_yen(stack_proj) 
+                            elif treshold_algorithm == 'li':
+                                thresh = fast_threshold_li(stack)
+                                thresh_proj = fast_threshold_li(stack_proj)
+                            
+                        
+
+                            
+                            #stack_flat = stack[stack > 0]
+                            # pct_90 = np.percentile(stack_flat, 90)
+                            # pct_95 = np.percentile(stack_flat, 95)
+                            
+                            print(f'treshold using {treshold_algorithm} = {thresh}')
+                        
+                            masks  = (stack > thresh).astype(np.uint8)
+                            mask_proj = stack_proj > thresh_proj
+                            
+                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['threshold'] = thresh
+                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['masks'] = masks
+                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['mask_proj'] = mask_proj
+                            
+
+
+                            path_out_al = path_out + '_' + treshold_algorithm + '.tif'
+                            imwrite(path_out_al, masks, imagej=True, resolution=(1/vxy, 1/vxy),
+                                    metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+                            
+                            print(f'saved {path_out_al}')
+                            
+                        if do_plot:
+                            plt.figure()
+                            plt.hist(stack.ravel(), bins=256)
+                            colors = [cm.tab10(i / len(treshold_algorithm_list)) for i in range(len(treshold_algorithm_list))]
+                            
+                            for i, thrsh_al in enumerate(treshold_algorithm_list):
+
+                                # print(thrsh_al, '<------------')
+                                thresh = results['s_'+str(series)]['c_'+str(channel)][key_dict][thrsh_al]['threshold']
+                                plt.axvline(thresh, color=colors[i], linestyle='--', label=thrsh_al)
+                            
+                
+                            
+                            plt.legend(loc='upper right', title='Thresholds')
+                            plt.title(f'series = {series}, channel = {channel}, {key_dict}')
+                            # plt.axvline(pct_90, color='c', linestyle='--')
+                            # plt.axvline(pct_95, color='m', linestyle='--')
+                            
+                            vmin, vmax = np.percentile(stack.ravel(), [1, 100])
+                            plt.xlim(0,vmax)# stack.max())
+                            plt.show()
+        return results
+# COLOCALIZATION #####################################################
 
 
 def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True):
@@ -567,6 +730,7 @@ def parse_lif_psf_params(lif_path, scene=0):
 
 
 def describe_acquisition(lif_path, do_print=True):
+    print("....")
     
     """
     Parse a Leica .lif file and print a per-scene summary of acquisition
