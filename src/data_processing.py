@@ -20,14 +20,21 @@ def loader2(date,user,split_frames=False, server=False):
     """
     system = platform.system()
     if system == 'Linux':
-        home = '/home'
+        if server:
+            base_dir = '/home/gerard/ITB/home/data/confocal'
+        else:
+            base_dir = '/home/gerard/data/confocal'
+        
     elif system == 'Darwin':
-        home = '/Users'
-    
-    if server:
-        base_dir = home + '/gerard/ITB/home/data/confocal'
-    else:
-        base_dir = home + '/gerard/data/confocal'
+        if server:
+            base_dir = '/Users/gerard/ITB/home/data/confocal'
+        else:
+            base_dir = '/Users/gerard/data/confocal'
+        
+    elif system == "Windows":
+        base_dir = 'C:/Users/cviko/data/confocal/'
+        
+
     
     all_path = os.path.join(base_dir, f"{date}_{user}")
     
@@ -329,7 +336,105 @@ def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=
     
     
     # return results
+# COLOCALIZATION
 
+
+def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True):
+   
+    if deconv_iter != 0:
+        deconv_str = 'deconv_iter_'+str(deconv_iter)
+    else:
+        deconv_str = 'raw'
+
+    chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str]['stack']
+    chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str]['stack']
+    chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str]['stack_proj']
+    chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str]['stack_proj']
+
+    mask_chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str][chA_thrsh_al]['masks'].astype(bool)
+    mask_chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str][chB_thrsh_al]['masks'].astype(bool)
+    mask_chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str][chA_thrsh_al]['mask_proj'].astype(bool)
+    mask_chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str][chB_thrsh_al]['mask_proj'].astype(bool)
+
+    
+    
+    mask_union = mask_chA | mask_chB
+
+    # per-frame Pearson R and Manders
+    r_per_frame  = []
+    M1_per_frame = []  # fraction of chA signal in chB-positive pixels
+    M2_per_frame = []  # fraction of chB signal in chA-positive pixels
+
+    for z in range(chA.shape[0]):
+        chA_f, chB_f     = chA[z], chB[z]
+        union_f          = mask_union[z]
+        maskA_f, maskB_f = mask_chA[z], mask_chB[z]
+
+        if union_f.sum() < min_val:
+            r_per_frame.append(np.nan)
+            M1_per_frame.append(np.nan)
+            M2_per_frame.append(np.nan)
+            continue
+
+        r = np.corrcoef(chA_f[union_f], chB_f[union_f])[0, 1]
+        r_per_frame.append(r)
+
+        # M1: fraction of chA signal that falls in chB-positive pixels
+        chA_total = chA_f[union_f].sum()
+        M1 = chA_f[maskB_f].sum() / chA_total if chA_total > 0 else np.nan
+        M1_per_frame.append(M1)
+
+        # M2: fraction of chB signal that falls in chA-positive pixels
+        chB_total = chB_f[union_f].sum()
+        M2 = chB_f[maskA_f].sum() / chB_total if chB_total > 0 else np.nan
+        M2_per_frame.append(M2)
+
+    # sum-projection metrics (single value per stack)
+    # chA_proj   = chA.sum(axis=0)
+    # chB_proj   = chB.sum(axis=0)
+
+    # threshold the sum projections directly — foreground = bright integrated across all frames
+    # maskA_proj = chA_proj > fast_threshold_li(chA_proj)
+    # maskB_proj = chB_proj > fast_threshold_li(chB_proj)
+    # previous version (too permissive — foreground if above threshold in any single frame):
+    # maskA_proj = mask_chA.any(axis=0)
+    # maskB_proj = mask_chB.any(axis=0)
+
+    union_proj = mask_chA_proj | mask_chB_proj
+
+    r_sum = np.corrcoef(chA_proj[union_proj], chB_proj[union_proj])[0, 1]
+    M1_sum = chA_proj[mask_chB_proj].sum() / chA_proj[union_proj].sum()
+    M2_sum = chB_proj[mask_chA_proj].sum() / chB_proj[union_proj].sum()
+
+    if do_plot:
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        axes[0].plot(r_per_frame)
+        axes[0].axhline(r_sum, color='r', linestyle='--', label=f'sum proj R={r_sum:.2f}')
+        axes[0].set_title(f'Pearson R  ch{chA_n} vs ch{chB_n}')
+        axes[0].set_xlabel('Frame'); axes[0].set_ylabel('R'); axes[0].legend()
+
+        axes[1].plot(M1_per_frame)
+        axes[1].axhline(M1_sum, color='r', linestyle='--', label=f'sum proj M1={M1_sum:.2f}')
+        axes[1].set_title(f'M1: ch{chA_n} signal in ch{chB_n}-positive pixels')
+        axes[1].set_xlabel('Frame'); axes[1].set_ylabel('M1'); axes[1].legend()
+
+        axes[2].plot(M2_per_frame)
+        axes[2].axhline(M2_sum, color='r', linestyle='--', label=f'sum proj M2={M2_sum:.2f}')
+        axes[2].set_title(f'M2: ch{chB_n} signal in ch{chA_n}-positive pixels')
+        axes[2].set_xlabel('Frame'); axes[2].set_ylabel('M2'); axes[2].legend()
+
+        plt.suptitle(f'Series {series}  |  deconv iter {deconv_iter}  |  threshold algorithms: {chA_thrsh_al} (ch{chA_n}), {chB_thrsh_al} (ch{chB_n})')
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        'r_per_frame':  r_per_frame,
+        'M1_per_frame': M1_per_frame,
+        'M2_per_frame': M2_per_frame,
+        'r_sum':        r_sum,
+        'M1_sum':       M1_sum,
+        'M2_sum':       M2_sum,
+    }
 
 
 ######################################## deconvolution
@@ -461,7 +566,8 @@ def parse_lif_psf_params(lif_path, scene=0):
     }
 
 
-def describe_acquisition(lif_path):
+def describe_acquisition(lif_path, do_print=True):
+    
     """
     Parse a Leica .lif file and print a per-scene summary of acquisition
     parameters: objective, sequential acquisition structure, per-channel PSF
@@ -636,48 +742,49 @@ def describe_acquisition(lif_path):
         all_scenes[scene_name] = scene_data
 
         # ── printed summary ────────────────────────────────────────────────────
-        W = 62
-        print(f'\n{"═"*W}')
-        print(f'Scene {scene_idx}: {scene_name}')
-        print('═'*W)
-        print(f'  Objective  : {obj_name}')
-        print(f'  NA / n     : {NA} / {n}')
-        print(f'  Voxel size : XY = {vxy:.4f} µm/px  |  Z = {vz:.4f} µm/step')
-        print(f'  Shape      : {nz} × {ny} × {nx}  (Z × Y × X)')
+        if do_print:
+            W = 62
+            print(f'\n{"═"*W}')
+            print(f'Scene {scene_idx}: {scene_name}')
+            print('═'*W)
+            print(f'  Objective  : {obj_name}')
+            print(f'  NA / n     : {NA} / {n}')
+            print(f'  Voxel size : XY = {vxy:.4f} µm/px  |  Z = {vz:.4f} µm/step')
+            print(f'  Shape      : {nz} × {ny} × {nx}  (Z × Y × X)')
 
-        print(f'\n  {"─"*38} Acquisition sequences')
-        for s_i, seq in enumerate(sequences):
-            laser_str = ' + '.join(f'{l} nm' for l in seq['lasers'])
-            tag = '  [simultaneous]' if len(seq['lasers']) > 1 else ''
-            print(f'  Seq {s_i+1}  laser(s): {laser_str}{tag}')
-            print(f'         pinhole  : {seq["pinhole_um"]:.2f} µm  ({seq["pinhole_airy"]:.3f} AU)')
-            for ch in seq['channels']:
-                dye_str = ch['dye_name'] if ch['dye_name'] else '(unnamed)'
-                print(f'         det ch{ch["detector_ch"]}  '
-                      f'{ch["band_nm"][0]:.0f}–{ch["band_nm"][1]:.0f} nm  '
-                      f'{dye_str:<22}  em = {ch["emission_nm"]:.0f} nm')
+            print(f'\n  {"─"*38} Acquisition sequences')
+            for s_i, seq in enumerate(sequences):
+                laser_str = ' + '.join(f'{l} nm' for l in seq['lasers'])
+                tag = '  [simultaneous]' if len(seq['lasers']) > 1 else ''
+                print(f'  Seq {s_i+1}  laser(s): {laser_str}{tag}')
+                print(f'         pinhole  : {seq["pinhole_um"]:.2f} µm  ({seq["pinhole_airy"]:.3f} AU)')
+                for ch in seq['channels']:
+                    dye_str = ch['dye_name'] if ch['dye_name'] else '(unnamed)'
+                    print(f'         det ch{ch["detector_ch"]}  '
+                        f'{ch["band_nm"][0]:.0f}–{ch["band_nm"][1]:.0f} nm  '
+                        f'{dye_str:<22}  em = {ch["emission_nm"]:.0f} nm')
 
-        print(f'\n  {"─"*38} Image channels (0-indexed)')
-        for ic in image_channels:
-            dye_str  = ic['dye'] if ic['dye'] else '(unnamed)'
-            nxy = '✓' if ic['nyquist_xy'] else '✗ sub-Nyquist'
-            nz_ = '✓' if ic['nyquist_z']  else '✗ sub-Nyquist'
-            print(f'  ch{ic["index"]}  {dye_str:<22}  em={ic["emission_nm"]:.0f} nm  '
-                  f'σ_xy={ic["sigma_xy_px"]:.2f}px ({ic["sigma_xy_um"]:.3f}µm) [{nxy}]  '
-                  f'σ_z={ic["sigma_z_px"]:.2f}px [{nz_}]  → {ic["deconv_mode"]}')
+            print(f'\n  {"─"*38} Image channels (0-indexed)')
+            for ic in image_channels:
+                dye_str  = ic['dye'] if ic['dye'] else '(unnamed)'
+                nxy = '✓' if ic['nyquist_xy'] else '✗ sub-Nyquist'
+                nz_ = '✓' if ic['nyquist_z']  else '✗ sub-Nyquist'
+                print(f'  ch{ic["index"]}  {dye_str:<22}  em={ic["emission_nm"]:.0f} nm  '
+                    f'σ_xy={ic["sigma_xy_px"]:.2f}px ({ic["sigma_xy_um"]:.3f}µm) [{nxy}]  '
+                    f'σ_z={ic["sigma_z_px"]:.2f}px [{nz_}]  → {ic["deconv_mode"]}')
 
-        print(f'\n  {"─"*38} Spectral bleed-through')
-        if bleed_through:
-            for bt in bleed_through:
-                print(f'  ⚠  [{bt["severity"]}]  {bt["source_dye"]}  →  '
-                      f'ch{bt["target_channel_index"]} ({bt["target_channel_dye"]})')
-                print(f'       {bt["cross_excitation_laser_nm"]} nm laser cross-excites '
-                      f'{bt["source_dye"]} (ex peak {bt["source_excitation_peak_nm"]} nm, '
-                      f'Δ={bt["delta_laser_to_peak_nm"]:+d} nm)')
-                print(f'       emission at {bt["source_emission_nm"]} nm falls in detection '
-                      f'band {bt["target_band_nm"][0]:.0f}–{bt["target_band_nm"][1]:.0f} nm')
-        else:
-            print('  None detected.')
+            print(f'\n  {"─"*38} Spectral bleed-through')
+            if bleed_through:
+                for bt in bleed_through:
+                    print(f'  ⚠  [{bt["severity"]}]  {bt["source_dye"]}  →  '
+                        f'ch{bt["target_channel_index"]} ({bt["target_channel_dye"]})')
+                    print(f'       {bt["cross_excitation_laser_nm"]} nm laser cross-excites '
+                        f'{bt["source_dye"]} (ex peak {bt["source_excitation_peak_nm"]} nm, '
+                        f'Δ={bt["delta_laser_to_peak_nm"]:+d} nm)')
+                    print(f'       emission at {bt["source_emission_nm"]} nm falls in detection '
+                        f'band {bt["target_band_nm"][0]:.0f}–{bt["target_band_nm"][1]:.0f} nm')
+            else:
+                print('  None detected.')
 
     return all_scenes
 
