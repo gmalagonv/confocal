@@ -972,7 +972,7 @@ def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
     return psf / psf.sum()
 
 
-def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None):
+def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, forced2d = False):
     """
     Deconvolve a confocal image using Richardson-Lucy with a theoretical
     Gaussian PSF derived from the microscope metadata in the .lif file.
@@ -1026,15 +1026,22 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None)
     is_3d = stack.ndim == 3
     # Nyquist: need σ ≥ 2 px (pixel ≤ σ/2) for the axis to be adequately sampled.
     # If Z is undersampled, fall back to 2D deconvolution applied per frame.
-    use_3d_psf = is_3d and (sigma_z_px >= 2.0)
+    use_3d_psf = is_3d and (sigma_z_px >= 2.0) and not forced2d
+    
+    if use_3d_psf:
+        deconv_type = "3d"
+    else:
+        deconv_type = "2d"
 
     if is_3d:
+        
         mode = '3D' if use_3d_psf else f'2D-per-frame (σ_z={sigma_z_px:.2f} px < 2, Z undersampled)'
         print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
               f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
         psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
     else:
+       
         print(f"PSF 2D (ch{channel}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px)")
         psf = _gaussian_psf(sigma_xy_px)
@@ -1069,7 +1076,7 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None)
     #new_name = glob_path + 'series_'+ str(scene) +'/'+'channel_'+ str(channel)+'/'+'deconv.tif'
     #name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'    #'s1_ch0_deconv_iter_4.tif
 
-    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
+    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type +'_iter_' + str(num_iter) + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
     
 
     print(name)
@@ -1081,6 +1088,41 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None)
 
     # return (result * scale).astype(np.float32)
     return result, sigma_xy_px
+
+
+def analyze_deconvolution_results(result, stack):
+    background_noise_ratios = []
+    for z in range(result.shape[0]):
+        ratio = result[z].max() / stack[z].max() + 1e-9
+        if ratio > 5:
+            print(f'Frame{z}: peak increased {ratio:2f}x - possible noise spike')
+            
+        bg_mask = stack[z] < np.percentile(stack[z], 10)
+        
+        # bg_orig_std == 0 means a flat/dark frame (e.g. all-zero edge slices).
+        # After deconv to float32 those pixels get tiny non-zero values, so the
+        # ratio blows up — not a real deconvolution problem, skip these frames.
+        if bg_mask.sum() < 2:
+            background_noise_ratios.append(0)
+            continue
+        
+        bg_orig_std = stack[z][bg_mask].std()          # ← only called when safe
+        
+        if bg_orig_std == 0:
+            background_noise_ratios.append(0)
+            continue
+
+        noise_ratio = result[z][bg_mask].std() / bg_orig_std
+        
+        if noise_ratio > 1.5:
+            background_noise_ratios.append(1)
+        else:
+            background_noise_ratios.append(0)
+    
+    inspected = [r for r in background_noise_ratios if r is not None]
+    flagged = sum(inspected)/len(inspected)
+    print(f'{flagged :.3f} of inspected frames flagged')
+    return flagged
 
 ################################
 
