@@ -8,10 +8,13 @@ from tifffile import imwrite
 import os
 import matplotlib.pyplot as plt
 import platform
+import matplotlib.cm as cm
 
 from pathlib import Path
 from scipy.ndimage import gaussian_filter, median_filter
 from skimage.restoration import richardson_lucy
+from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triangle, threshold_yen, threshold_li
+
 
 def loader2(date,user,split_frames=False, server=False):
     
@@ -407,8 +410,8 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
             for deconv_iter in deconv_iter_list:
             
                 
-                path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv_iter_{deconv_iter}.tif')
-                path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv_iter_{deconv_iter}_masks')
+                path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}.tif')
+                path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}_masks')
 
                 for path_in, path_out in [(path_raw, path_raw_masks), (path_deconv, path_deconv_masks)]:
                     
@@ -424,7 +427,7 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
                     if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
                         results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
 
-                    
+                        print(path_in)
                         with tiff.TiffFile(path_in) as tf:
                             stack = tf.asarray()
                             vxy = 1.0 / (tf.pages[0].tags['XResolution'].value[0] / tf.pages[0].tags['XResolution'].value[1])
