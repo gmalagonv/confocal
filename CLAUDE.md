@@ -64,8 +64,74 @@ On Linux (server): same environment name, activated normally via `conda activate
 - `num_iter=15` default; use 5–10 for a first check, 10–30 typical range
 - **Return value**: `(result, sigma_xy_px)` — the deconvolved array and the XY PSF sigma in pixels (useful for quality checks)
 
+### Pinhole size and PSF calibration
+The PSF formulas (`σ_xy = 0.21λ/NA`, `σ_z = 0.66λn/NA²`) are calibrated for approximately **1 Airy Unit (AU)** pinhole. Actual pinhole size changes the PSF shape — not just brightness:
+
+| Pinhole | Actual PSF vs formula | Consequence for RL |
+|---|---|---|
+| ~1 AU | Matches | Correct deconvolution |
+| < 1 AU (e.g. 0.2 AU) | Narrower (~0.7×) | Formula overestimates blur → **over-deconvolution** (ringing, structure fusion) |
+| > 1 AU | Broader | Formula underestimates blur → under-correction |
+
+**Correction for sub-AU pinholes** — approximate scaling factor:
+```python
+def _pinhole_psf_factor(pinhole_au):
+    p = min(max(pinhole_au, 0.0), 1.0)
+    return 1.0 / np.sqrt(2) + (1.0 - 1.0 / np.sqrt(2)) * p  # 0.707 at 0 AU → 1.0 at 1 AU
+
+factor = _pinhole_psf_factor(pinhole_au)
+sigma_xy_px *= factor
+sigma_z_px  *= factor
+```
+Gold standard: image 100 nm fluorescent beads and fit PSF directly — accounts for all aberrations.
+
+**Practical guidance on pinhole choice:**
+- **1 AU**: best balance — formula is well-calibrated, ~84% of focal-plane signal collected, good SNR. Recommended for quantitative intensity/colocalization measurements.
+- **< 1 AU** (e.g. 0.2 AU): maximum lateral resolution (narrower PSF by ~√2), better optical sectioning, but ~10× less light, noisier images, PSF mismatch degrades deconvolution. Only justified when resolving closely spaced sub-diffraction structures (e.g. individual BRP puncta) in a thin, bright sample.
+- **> 1 AU**: more light, approaches widefield (less optical sectioning). Useful for thick/scattering tissue or very weak signals.
+
+### 3D vs 2D deconvolution — practical threshold
+The code switches to 3D RL at `σ_z_px ≥ 2.0`. In practice, **3D RL is unstable near this threshold**:
+- At σ_z ≈ 2 px (barely Nyquist): zero-padding boundary artifacts appear in the first/last ~3 frames (they become progressively brighter with more iterations); structures near each other can fuse.
+- Reliable 3D RL requires **σ_z ≥ 3 px**. Consider raising the threshold in the code:
+  ```python
+  use_3d_psf = is_3d and (sigma_z_px >= 3.0) and not forced2d
+  ```
+- When in doubt, use `forced2d=True`. 2D-per-frame is more conservative and avoids Z-boundary artifacts entirely.
+
 ### Quality check used in notebooks
 Re-blur the deconvolved result with `gaussian_filter(result[z], sigma=sigma_xy_px)` and compute the residual vs the original frame. Flag frames where the background noise ratio (`result[bg].std() / original[bg].std()`) exceeds 1.5× — those frames may have noise amplification. The background mask is defined as pixels below the 10th percentile of the original frame.
+
+**Known limitations of the quality check:**
+- Skipped frames (dark edge slices where `bg_orig_std == 0`) append `0` (coded as "no problem") and are included in the denominator — artificially lowering the reported fraction. Track skipped frames separately for an accurate count.
+- The peak-ratio check (`result.max() / stack.max() > 5`) rarely fires because `_process` normalises by `img.max()` before RL and rescales after. It can be dropped.
+- The check is global (pixel values) and does **not** detect ringing/structure fusion — those require visual inspection of individual frames.
+
+### Parallelizing deconvolution loops
+`AICSImage.set_scene()` is stateful — parallel calls corrupt each other's scene pointer. Two-phase approach:
+```python
+from joblib import Parallel, delayed
+
+# Phase 1: load stacks sequentially (img is stateful)
+stacks = {}
+for scene in scenes:
+    img.set_scene(img.scenes[scene])
+    for channel in channels:
+        stacks[(scene, channel)] = img.get_image_data("ZYX", T=0, C=channel)
+
+# Phase 2: parallel deconvolution (threading shares imports & sys.path)
+def run_one(stack, scene, channel, num_iter, forced2d):
+    result, sigma_xy_px = deconvolve(stack, path, channel=channel, scene=scene,
+                                     num_iter=num_iter, forced2d=forced2d)
+    return analyze_deconvolution_results(result, stack)
+
+results = Parallel(n_jobs=8, backend='threading')(
+    delayed(run_one)(stacks[(s, c)], s, c, n, f2d)
+    for s in scenes for c in scene_channels[s]
+    for n in iterations for f2d in [False, True]
+)
+```
+Use `backend='threading'` (not `'loky'`): threads share the notebook's `sys.path` so imports work; scipy's FFT releases the GIL so real CPU parallelism is achieved. With 16 cores, `n_jobs=8` is a safe starting point.
 
 ### Known microscope parameters (2025-11-29 dataset)
 - Objective: HC PL APO CS2 40x/1.30 OIL (DMI8-CS)
@@ -106,9 +172,23 @@ Determined by cross-referencing active lasers with detection bands:
 - **ch1 ↔ ch2 (HSP70/Mito pair)**: Clean — acquired in separate sequences with non-overlapping excitation. No significant bleed-through. This pair is suitable for colocalization analysis.
 - Bleed-through was identified by parsing `ATLConfocalSettingDefinition` XML blocks from the `.lif` file and checking whether emission peaks of non-target dyes fall within each detector's active wavelength band.
 
+### Known microscope parameters (2026-06-05 dataset)
+- Dataset: `2026_06_05_Carmina` — 10 scenes, alpha prime and gamma Mushroom Body regions (left/right hemispheres, multiple brains)
+- Objective: HC PL APO CS2 **63x/1.40 OIL** (NA = 1.4, same objective as 2026-05-26)
+- NA = 1.4, n = 1.518 (oil)
+- Voxel size: XY = 0.0226 µm/px, Z = 0.1307 µm/step
+- **Pinhole: 20 µm = 0.209 AU** — very small, nearly ideal confocal. Actual PSF is ~30–40% narrower than formula. Use `forced2d=True` or ≤ 2 iterations to avoid over-deconvolution.
+- Antibodies: Alexa 488 (BRP/ch0), Cy5 (HSP70/ch1), Alexa 546 (Mito/ch2)
+- Acquisition: two sequences — Seq1: 488+638 nm simultaneous (ch0 BRP + ch1 HSP70); Seq2: 552 nm only (ch2 Mito)
+- σ values at 0.209 AU (formula overestimates): formula gives σ_xy=3.45 px, σ_z=2.03 px for ch0 (Alexa 488); true values ~2.4 px and ~1.4 px respectively → actual PSF is below Nyquist in Z
+- Bleed-through: Alexa 546 → ch0 (MEDIUM); Cy5 → ch2 (LOW)
+
 ## Analysis notebooks
 - `analysis_notebooks/` — one notebook per imaging session date (format `YY_MM_DD.ipynb`)
 - Notebooks load functions from `src/data_processing.py`
+
+### `26_06_05_gerardo.ipynb` — deconvolution testing on 2026_06_05_Carmina data
+Tests RL deconvolution across all 10 scenes, 3 channels, multiple iteration counts (2, 4, 6, 10, 15, 20), comparing automatic mode vs `forced2d=True`. Uses parallelized approach (joblib threading). Key finding: at 0.209 AU pinhole, 3D mode causes boundary artifacts and structure fusion even at 2 iterations; `forced2d=True` with ≤ 4 iterations is more appropriate for this dataset.
 
 ### `26_05_26.ipynb` — current active notebook (as of 2026-06-03)
 This notebook has two main sections:
