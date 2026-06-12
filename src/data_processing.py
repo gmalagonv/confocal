@@ -427,7 +427,7 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
                     if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
                         results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
 
-                    
+                        print(path_in)
                         with tiff.TiffFile(path_in) as tf:
                             stack = tf.asarray()
                             vxy = 1.0 / (tf.pages[0].tags['XResolution'].value[0] / tf.pages[0].tags['XResolution'].value[1])
