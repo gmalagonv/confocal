@@ -733,7 +733,7 @@ def parse_lif_psf_params(lif_path, scene=0):
 
 
 def describe_acquisition(lif_path, do_print=True):
-    print("....")
+    
     
     """
     Parse a Leica .lif file and print a per-scene summary of acquisition
@@ -974,6 +974,11 @@ def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
         psf = gaussian_filter(psf, sigma=[sigma_xy_px, sigma_xy_px])
     return psf / psf.sum()
 
+def _pinhole_psf_factor(pinhole_au):
+    p = min(max(pinhole_au, 0.0), 1.0)
+    return 1.0 / np.sqrt(2) + (1.0 - 1.0 / np.sqrt(2)) * p  # 0.707 at 0 AU → 1.0 at 1 AU
+
+
 
 def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, forced2d = False):
     """
@@ -1020,7 +1025,9 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # Use known fluorophore emission peak if provided, else fall back to
     # detection-band midpoint from metadata (can be ~15-20% off for wide windows).
     lam = (emission_nm if emission_nm is not None else params['emission_nm'][channel]) * 1e-3  # nm → µm
-
+    pinhole = params['pinhole_airy'][channel]
+    print(f"Pinhole size (ch{channel}): {pinhole} AU")
+    
     sigma_xy_um = 0.21 * lam / NA
     sigma_z_um  = 0.66 * lam * n / (NA ** 2)
     sigma_xy_px = sigma_xy_um / vxy
