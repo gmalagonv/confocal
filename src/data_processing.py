@@ -1,3 +1,5 @@
+#from more_itertools import factor
+
 import tifffile as tiff
 import numpy as np
 from aicsimageio.readers import LifReader
@@ -508,19 +510,28 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
 def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True):
    
     if deconv_iter != 0:
-        deconv_str = 'deconv_iter_'+str(deconv_iter)
+        deconv_str = 'deconv_iter_'+ str(deconv_iter)
+        deconv_str_mask = deconv_str 
+        if deconv_iter < 0:
+            deconv_iter*=-1
+            deconv_str = 'raw'
+            deconv_str_mask = 'deconv_iter_'+ str(deconv_iter)
+            print(f"deconv. iter {deconv_iter} will be used for masking, but raw stack will be used for metrics")
+            
+        
     else:
         deconv_str = 'raw'
+        deconv_str_mask = deconv_str 
 
     chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str]['stack']
     chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str]['stack']
     chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str]['stack_proj']
     chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str]['stack_proj']
 
-    mask_chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str][chA_thrsh_al]['masks'].astype(bool)
-    mask_chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str][chB_thrsh_al]['masks'].astype(bool)
-    mask_chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str][chA_thrsh_al]['mask_proj'].astype(bool)
-    mask_chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str][chB_thrsh_al]['mask_proj'].astype(bool)
+    mask_chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str_mask][chA_thrsh_al]['masks'].astype(bool)
+    mask_chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str_mask][chB_thrsh_al]['masks'].astype(bool)
+    mask_chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str_mask][chA_thrsh_al]['mask_proj'].astype(bool)
+    mask_chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str_mask][chB_thrsh_al]['mask_proj'].astype(bool)
 
     
     
@@ -1025,13 +1036,33 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # Use known fluorophore emission peak if provided, else fall back to
     # detection-band midpoint from metadata (can be ~15-20% off for wide windows).
     lam = (emission_nm if emission_nm is not None else params['emission_nm'][channel]) * 1e-3  # nm → µm
-    pinhole = params['pinhole_airy'][channel]
-    print(f"Pinhole size (ch{channel}): {pinhole} AU")
+    
+    info = describe_acquisition(lif_path, do_print=False)
+
+    pinhole = info[list(info.keys())[scene]]['sequences'][0]['pinhole_airy']
+    # correct pinhole based on lambda
+    #print(lam, '<------------------ lam')
+    pinhole = pinhole * (0.519 / lam)  # scale by emission wavelength relative to 519 nm reference
+
+    print( pinhole, '<------------------ pinhole')
+    factor = _pinhole_psf_factor(pinhole)
+    
+
+    #print(f"Pinhole size : {pinhole} AU, Factor applied to PSF σ: {factor:.3f}")
     
     sigma_xy_um = 0.21 * lam / NA
     sigma_z_um  = 0.66 * lam * n / (NA ** 2)
+    
+    
     sigma_xy_px = sigma_xy_um / vxy
     sigma_z_px  = sigma_z_um  / vz
+    
+    if factor != 1.0:
+        print(f"Applying pinhole factor {factor:.3f} to PSF σ values: "
+              f"σ_xy {sigma_xy_px:.2f} px → {sigma_xy_px*factor:.2f} px, "
+              f"σ_z {sigma_z_px:.2f} px → {sigma_z_px*factor:.2f} px")
+        sigma_xy_px *= factor
+        sigma_z_px  *= factor
 
     is_3d = stack.ndim == 3
     # Nyquist: need σ ≥ 2 px (pixel ≤ σ/2) for the axis to be adequately sampled.
@@ -1046,14 +1077,24 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     if is_3d:
         
         mode = '3D' if use_3d_psf else f'2D-per-frame (σ_z={sigma_z_px:.2f} px < 2, Z undersampled)'
+        if use_3d_psf:
+            mode = '3D'
+        else:
+            if forced2d:
+                mode = f'2D-per-frame (σ_z={sigma_z_px:.2f} px, FORCED)'
+            else:
+                mode = f'2D-per-frame (σ_z={sigma_z_px:.2f} px < 2, Z undersampled)'
+                
+        
+        
         print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
-              f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px) | "
-              f"σ_z={sigma_z_um:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
+              f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px) | "
+              f"σ_z={sigma_z_um * factor:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
         psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
     else:
        
         print(f"PSF 2D (ch{channel}): λ={lam*1e3:.0f} nm | "
-              f"σ_xy={sigma_xy_um:.3f} µm ({sigma_xy_px:.2f} px)")
+              f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px)")
         psf = _gaussian_psf(sigma_xy_px)
 
     def _process(img):
