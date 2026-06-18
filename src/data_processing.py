@@ -16,6 +16,9 @@ from pathlib import Path
 from scipy.ndimage import gaussian_filter, median_filter
 from skimage.restoration import richardson_lucy
 from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triangle, threshold_yen, threshold_li
+#from skimage.measure import label
+from scipy.ndimage import label, binary_fill_holes, binary_closing, gaussian_filter
+from skimage.morphology import convex_hull_image
 
 
 def loader2(date,user,split_frames=False, server=False):
@@ -346,6 +349,109 @@ def signals(date, user, series_n, masks_suffixes, channels_suffixes =[], server=
 # THRESHOLDING #####################################################
 
 
+def defining_MB_mask(results, series, channel, deconv_iter):
+    # consensus maks
+    list_masks = []
+    keys2ignore = ['stack', 'stack_proj']
+    for i in results['s_'+ str(series)]['c_' + str(channel)]['raw'].keys():
+        if i not in keys2ignore:
+            #stack_raw = results['s_'+ str(series)]['c_' + str(channel)]['raw'][i]['masks']
+            stack_deconv = results['s_'+ str(series)]['c_' + str(channel)]['deconv_iter_' + str(deconv_iter)][i]['masks']
+            #list_masks.append(stack_raw)
+            list_masks.append(stack_deconv)
+            
+    stack = np.stack(list_masks, axis=0)
+    print(stack.shape)
+    prob_MB = stack.mean(axis=0).astype(np.float32)
+    print(prob_MB.shape)
+
+    return prob_MB
+
+def defining_MB_mask_2(results, series, channel, deconv_iter, thresholding_al, closing_radius=5):
+    deconv_mask = results['s_'+ str(series)]['c_' + str(channel)]['deconv_iter_' + str(deconv_iter)][thresholding_al]['masks']
+
+    struct2d = np.ones((closing_radius * 2 + 1, closing_radius * 2 + 1), dtype=bool)
+    frames = []
+    for z in range(deconv_mask.shape[0]):
+        frame = binary_fill_holes(binary_closing(deconv_mask[z], structure=struct2d))
+        r = closing_radius
+        frame[:r, :] = False
+        frame[-r:, :] = False
+        frame[:, :r] = False
+        frame[:, -r:] = False
+        frames.append(frame)
+    processed = np.stack(frames)
+
+    labels, _ = label(processed)
+    largest = labels == np.argmax(np.bincount(labels.flat)[1:]) + 1
+
+    return largest.astype(np.uint8)
+
+
+def defining_MB_mask_3(results, series, channel, deconv_iter, prob_threshold=0.5, closing_radius=5):
+    # Build probability mask: mean of all algorithm masks (algorithms that agree score higher)
+    prob_mask = defining_MB_mask(results, series, channel, deconv_iter)
+    binary = (prob_mask > prob_threshold).astype(np.uint8)
+
+    struct2d = np.ones((closing_radius * 2 + 1, closing_radius * 2 + 1), dtype=bool)
+    frames = []
+    for z in range(binary.shape[0]):
+        frame = binary_fill_holes(binary_closing(binary[z], structure=struct2d))
+        r = closing_radius
+        frame[:r, :] = False
+        frame[-r:, :] = False
+        frame[:, :r] = False
+        frame[:, -r:] = False
+        frames.append(frame)
+    processed = np.stack(frames)
+
+    labels, _ = label(processed)
+    largest = labels == np.argmax(np.bincount(labels.flat)[1:]) + 1
+
+    return largest.astype(np.uint8)
+
+
+def defining_MB_mask_4(results, series, channel, deconv_iter, prob_threshold=0.5):
+    "I knid of like this approach, though ends up with not very organic shapes"
+    
+    #prob_mask = defining_MB_mask(results, series, channel, deconv_iter)
+    #binary = prob_mask > prob_threshold
+    binary = results['s_'+ str(series)]['c_' + str(channel)]['deconv_iter_' + str(deconv_iter)]['triangle']['masks']
+    frames = []
+    for z in range(binary.shape[0]):
+        frame = binary[z]
+        if frame.any():
+            frame = convex_hull_image(frame)
+        else:
+            frame = np.zeros_like(frame, dtype=bool)
+        frames.append(frame)
+
+    return np.stack(frames).astype(np.uint8)
+
+def defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz):
+    stack = results['s_'+ str(series)]['c_' + str(channel)]['deconv_iter_' + str(deconv_iter)]['stack']
+    #stack = results['s_'+ str(series)]['c_' + str(channel)]['raw']['stack']
+
+    # sigma in µm, converted to pixels
+    ## sigma_um = 0.8: good for otsu, 0.6 creates holes
+    
+    sigma_um = 0.8   # tune this: larger = smoother envelope, smaller = tighter to puncta
+    
+    sigma_xy_px = sigma_um / vxy
+    sigma_z_px  = sigma_um / vz
+    print(sigma_xy_px, sigma_xy_px, '<-----------------------------------')
+    
+    blurred = gaussian_filter(stack.astype(np.float32),
+                          sigma=[sigma_z_px, sigma_xy_px, sigma_xy_px])
+
+    thresh = threshold_otsu(blurred)
+    #thresh = threshold_triangle(blurred)
+    #thresh = fast_threshold_li(blurred)
+
+
+    mb_mask = (blurred > thresh).astype(np.uint8)
+    return mb_mask
+
 def fast_threshold_li(stack):
     s_min, s_max = float(stack.min()), float(stack.max())
     if s_max == s_min:
@@ -355,8 +461,8 @@ def fast_threshold_li(stack):
     return t_u16 / 65535 * (s_max - s_min) + s_min
 
 
-def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
-    
+def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, do_plot = True ):
+    print(series_list)
     server = False
     system = platform.system()
     if system == 'Linux':
@@ -429,6 +535,9 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
                     if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
                         results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
 
+                        if not os.path.exists(path_in):
+                            print(f'  Skipping (file not found): {path_in}')
+                            continue
                         print(path_in)
                         with tiff.TiffFile(path_in) as tf:
                             stack = tf.asarray()
@@ -481,6 +590,7 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
                                     metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
                             
                             print(f'saved {path_out_al}')
+                        
                             
                         if do_plot:
                             plt.figure()
@@ -503,15 +613,40 @@ def thresholding(date, user, series_list, deconv_iter_list, do_plot = True ):
                             vmin, vmax = np.percentile(stack.ravel(), [1, 100])
                             plt.xlim(0,vmax)# stack.max())
                             plt.show()
-        return results
+                
+                if channel ==  channel_struct:
+                   # mb_prob_mask = defining_MB_mask(results, series, channel, deconv_iter)
+                   # mb_bin_mask = (mb_prob_mask > 0.7).astype(np.uint8)
+
+                   #mb_prob_mask = defining_MB_mask_2(results, series, channel, deconv_iter, 'li')
+                   #mb_prob_mask = defining_MB_mask_3(results, series, channel, deconv_iter, prob_threshold=0.5, closing_radius=5)
+                   #mb_prob_mask = defining_MB_mask_4(results, series, channel, deconv_iter, prob_threshold=0.5)
+                   
+                   #mb_prob_mask = mb_prob_mask.astype(np.uint8)
+                   mb_mask = defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz)
+                   results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb'] = mb_mask
+                   #results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb_bin'] = mb_bin_mask
+
+                   path_out_MB_prob = path_deconv_masks + '_mb' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
+                   #path_out_MB_bin = path_deconv_masks + '_mb_bin' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
+
+                   imwrite(path_out_MB_prob, mb_mask, imagej=True, resolution=(1/vxy, 1/vxy),
+                                    metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+                #    imwrite(path_out_MB_bin, mb_bin_mask, imagej=True, resolution=(1/vxy, 1/vxy),
+                #                     metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+                   
+                   #print(f'saved {path_out_MB_prob}')   
+                            
+    return results
 # COLOCALIZATION #####################################################
 
 
-def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True):
+def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True, 
+                           MB_restrict=True):
    
     if deconv_iter != 0:
         deconv_str = 'deconv_iter_'+ str(deconv_iter)
-        deconv_str_mask = deconv_str 
+        deconv_str_mask = 'deconv_iter_'+ str(deconv_iter) 
         if deconv_iter < 0:
             deconv_iter*=-1
             deconv_str = 'raw'
@@ -521,7 +656,7 @@ def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_th
         
     else:
         deconv_str = 'raw'
-        deconv_str_mask = deconv_str 
+        deconv_str_mask = 'raw' 
 
     chA = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str]['stack']
     chB = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str]['stack']
@@ -533,6 +668,11 @@ def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_th
     mask_chA_proj = dict_data['s_'+str(series)]['c_'+str(chA_n)][deconv_str_mask][chA_thrsh_al]['mask_proj'].astype(bool)
     mask_chB_proj = dict_data['s_'+str(series)]['c_'+str(chB_n)][deconv_str_mask][chB_thrsh_al]['mask_proj'].astype(bool)
 
+    if MB_restrict:
+        print('analysis restricted to MB area')
+        MB_mask = dict_data['s_'+str(series)]['c_2'][deconv_str_mask]['mb'].astype(bool)
+        mask_chA = mask_chA & MB_mask
+        mask_chB = mask_chB & MB_mask
     
     
     mask_union = mask_chA | mask_chB
