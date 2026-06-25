@@ -8,6 +8,12 @@
 Branches stay alive — they are personal workspaces. Neither is deleted automatically.
 
 ---
+## After some changes have been done:
+```bash
+# 1. Before starting work — get latest from main
+git add .
+git commit -m "message"
+git push
 
 ## Daily workflow (each person)
 
