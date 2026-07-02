@@ -31,6 +31,47 @@ where the expected overlap is calculated assuming the two signals are distribute
 
 The odds ratio (OR) is the most statistically rigorous of the three. It asks: *how much more likely is a pixel to be B-positive if it is A-positive, compared to if it is A-negative?*
 
+#### How it is computed: the 2×2 contingency table
+
+Every pixel inside the analysis region (MASK) is classified into one of four categories:
+
+```
+                    Mito-positive      Mito-negative
+HSP-positive          A_and_B            A_not_B
+HSP-negative          B_not_A            neither
+```
+
+```python
+A_and_B = (mask_chA_MB &  mask_chB_MB).sum()   # positive for both
+A_not_B = (mask_chA_MB & ~mask_chB_MB).sum()   # HSP only
+B_not_A = (~mask_chA_MB &  mask_chB_MB).sum()  # Mito only
+neither = MASK.sum() - A_and_B - A_not_B - B_not_A  # neither (within MASK)
+```
+
+The `neither` cell is computed by subtraction rather than directly as `(~mask_chA_MB & ~mask_chB_MB).sum()`. Even though `mask_chA_MB` has the MASK baked in, taking its complement undoes the restriction — by De Morgan's law:
+
+```
+~mask_chA_MB = ~(mask_chA & MASK) = ~mask_chA | ~MASK
+```
+
+The `| ~MASK` term means every pixel *outside* the MASK evaluates to True, so they all get counted in `neither`, inflating it by the entire image background. The subtraction approach avoids any complement and is always correct, since the four cells must exactly partition the MASK:
+
+```python
+neither = MASK.sum() - A_and_B - A_not_B - B_not_A
+```
+
+The equivalent direct fix (complement before restricting) would be `(MASK & ~mask_chA & ~mask_chB).sum()`, but the subtraction form is simpler.
+
+Fisher's exact test then asks: are the rows (HSP status) and columns (Mito status) independent? The OR it returns is:
+
+```
+OR = (A_and_B × neither) / (A_not_B × B_not_A)
+```
+
+If HSP and Mito are spatially independent, a HSP-positive pixel is no more likely to be Mito-positive than a HSP-negative pixel → OR = 1. OR > 1 means co-occurrence is above chance.
+
+`alternative='greater'` tests the one-sided hypothesis OR > 1. With microscopy images (tens of thousands of pixels), p-values are almost always near zero — what matters is the size of the OR, not the p-value.
+
 - **OR = 1**: knowing a pixel is A-positive gives no information about B — the two signals are independent
 - **OR > 1**: A-positive pixels are more likely to carry B signal — positive co-localization
 - **OR = 52**: an A-positive pixel is 52 times more likely to also be B-positive than an A-negative pixel

@@ -856,7 +856,23 @@ def parse_lif_psf_params(lif_path, scene=0):
                 chan_emission[ch] = (left + right) / 2.0
 
         if not chan_emission:
-            continue
+            # Leica sometimes omits MultiBand entries for sequential blocks.
+            # Synthesize emission from the closest-matching dye excitation peak.
+            ref_laser = max(active_lasers)
+            best_em, best_delta = ref_laser + 20, 9999
+            for dye_name, ex_peak in {
+                'Leica/ALEXA 405': 402, 'Leica/ALEXA 488': 495, 'Leica/ALEXA 546': 556,
+                'Leica/ALEXA 555': 555, 'Leica/ALEXA 568': 578, 'Leica/ALEXA 594': 590,
+                'Leica/ALEXA 633': 632, 'Leica/ALEXA 647': 650, 'Leica/ALEXA 680': 679,
+                'Leica/ALEXA 750': 749, 'Leica/Cy3': 550, 'Leica/Cy5': 649,
+                'Leica/Cy7': 743, 'Leica/FITC': 495, 'Leica/TRITC': 547,
+            }.items():
+                delta = abs(ex_peak - ref_laser)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_em = _dye_emission.get(dye_name, ref_laser + 20)
+            for det_ch in sorted(active_det_chs):
+                chan_emission[det_ch] = best_em
 
         # Deduplicate: same dye/band configuration appears once per series
         config_key = frozenset(chan_emission.items())
@@ -864,7 +880,25 @@ def parse_lif_psf_params(lif_path, scene=0):
             continue
         seen_configs.add(config_key)
 
-        sequences.append({'min_laser': min(active_lasers), 'channels': chan_emission})
+        sequences.append({
+            'min_laser':  min(active_lasers),
+            'lasers':     active_lasers,
+            'channels':   chan_emission,
+            'n_named':    sum(1 for mb in block.iter('MultiBand')
+                              if int(mb.attrib['Channel']) in active_det_chs
+                              and mb.attrib.get('DyeName', '') in _dye_emission),
+        })
+
+    # Remove dominated sequences: same laser set but fewer channels or fewer named dyes.
+    seqs_by_lasers: dict = {}
+    for s in sequences:
+        key = frozenset(s['lasers'])
+        existing = seqs_by_lasers.get(key)
+        if existing is None:
+            seqs_by_lasers[key] = s
+        elif (len(s['channels']), s['n_named']) > (len(existing['channels']), existing['n_named']):
+            seqs_by_lasers[key] = s
+    sequences = list(seqs_by_lasers.values())
 
     # Sort sequences by minimum active laser wavelength, then flatten
     sequences.sort(key=lambda s: s['min_laser'])
@@ -935,6 +969,19 @@ def describe_acquisition(lif_path, do_print=True):
                 obj_name = elem.attrib.get('ObjectiveName', 'unknown').strip()
                 break
 
+        # Pre-pass: find the first block that has a valid non-zero pinhole. Some
+        # sequential blocks (e.g. 552 nm-only) are missing the Pinhole attribute
+        # entirely; we fall back to this value rather than reporting 0 AU.
+        fallback_pinhole_m    = 0.0
+        fallback_pinhole_airy = 0.0
+        for block in reader.metadata.iter('ATLConfocalSettingDefinition'):
+            ph_m    = float(block.attrib.get('Pinhole',     0) or 0)
+            ph_airy = float(block.attrib.get('PinholeAiry', 0) or 0)
+            if ph_airy > 0:
+                fallback_pinhole_m    = ph_m
+                fallback_pinhole_airy = ph_airy
+                break
+
         # Parse unique acquisition sequences (same logic as parse_lif_psf_params)
         sequences = []
         seen_configs = set()
@@ -965,19 +1012,57 @@ def describe_acquisition(lif_path, do_print=True):
                 seq_chs.append({'detector_ch': ch, 'band_nm': (left, right),
                                  'dye_name': dye, 'emission_nm': em})
             if not seq_chs:
-                continue
+                # Leica sometimes omits MultiBand entries for sequential blocks (seen in
+                # 2026-06 datasets). Synthesize a bare channel per active detector using
+                # the active laser wavelength as the excitation reference so the channel
+                # still appears in the output. The band/emission estimate is rough; it
+                # will be superseded if another block with the same laser set has named
+                # dyes (dominated-sequence removal below keeps the better-defined one).
+                ref_laser = max(active_lasers)
+                # find closest known dye by excitation peak to get a better emission guess
+                closest_em = ref_laser + 20
+                best_delta = 9999
+                for dye_name, ex_peak in _dye_excitation.items():
+                    delta = abs(ex_peak - ref_laser)
+                    if delta < best_delta:
+                        best_delta = delta
+                        closest_em = _dye_emission.get(dye_name, ref_laser + 20)
+                for det_ch in sorted(active_det_chs):
+                    seq_chs.append({
+                        'detector_ch': det_ch,
+                        'band_nm':     (ref_laser, ref_laser + 250),
+                        'dye_name':    '',
+                        'emission_nm': closest_em,
+                    })
             config_key = frozenset((c['detector_ch'], c['emission_nm']) for c in seq_chs)
             if config_key in seen_configs:
                 continue
             seen_configs.add(config_key)
-            pinhole_m    = float(block.attrib.get('Pinhole', 0))
-            pinhole_airy = float(block.attrib.get('PinholeAiry', 0))
+            pinhole_m    = float(block.attrib.get('Pinhole',     0) or 0) or fallback_pinhole_m
+            pinhole_airy = float(block.attrib.get('PinholeAiry', 0) or 0) or fallback_pinhole_airy
             sequences.append({
                 'lasers':       active_lasers,
                 'channels':     sorted(seq_chs, key=lambda c: c['detector_ch']),
                 'pinhole_um':   round(pinhole_m * 1e6, 2),
                 'pinhole_airy': round(pinhole_airy, 3),
             })
+
+        # Remove dominated sequences: when two sequences share the same laser set, keep
+        # only the one with the most channels, breaking ties by preferring named dyes.
+        # This discards alignment/preview scans that use the same lasers as a real
+        # acquisition but activate fewer detectors or lack dye metadata.
+        seqs_by_lasers: dict = {}
+        for s in sequences:
+            key = frozenset(s['lasers'])
+            existing = seqs_by_lasers.get(key)
+            if existing is None:
+                seqs_by_lasers[key] = s
+            else:
+                s_named  = sum(1 for c in s['channels']        if c['dye_name'])
+                ex_named = sum(1 for c in existing['channels'] if c['dye_name'])
+                if (len(s['channels']), s_named) > (len(existing['channels']), ex_named):
+                    seqs_by_lasers[key] = s
+        sequences = list(seqs_by_lasers.values())
         sequences.sort(key=lambda s: min(s['lasers']))
 
         # Build image_channels with PSF + Nyquist info (ordered by acquisition sequence)
