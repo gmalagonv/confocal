@@ -21,7 +21,7 @@ from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triang
 #from skimage.measure import label
 from scipy.ndimage import label, binary_fill_holes, binary_closing, gaussian_filter
 from skimage.morphology import convex_hull_image
-
+import statistics
 
 def loader2(date,user,split_frames=False, server=False):
     
@@ -446,9 +446,8 @@ def defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz):
     blurred = gaussian_filter(stack.astype(np.float32),
                           sigma=[sigma_z_px, sigma_xy_px, sigma_xy_px])
 
-    thresh = threshold_otsu(blurred)
-    #thresh = threshold_triangle(blurred)
-    #thresh = fast_threshold_li(blurred)
+    #thresh = threshold_otsu(blurred)
+    thresh = np.percentile(blurred, 70)
 
 
     mb_mask = (blurred > thresh).astype(np.uint8)
@@ -494,11 +493,13 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
     'li',
     '95',
     '98',
+    #'consensus',
     
     ]
+    if len(deconv_iter_list) == 1:
+        deconv_iter_list = deconv_iter_list * len(series_list)
     
-    
-    for series in series_list:
+    for s, series in enumerate(series_list):
         print(f'Processing series {series}---------------')
         results['s_'+str(series)] = {}
         
@@ -520,192 +521,212 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
             path_raw_masks  = os.path.join(base, f'{date}_s{series}_ch{channel}_masks')
             
             
-            for deconv_iter in deconv_iter_list:
+            #for deconv_iter in deconv_iter_list:
+            deconv_iter = deconv_iter_list[s]
+                
+            path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}.tif')
+            path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}_masks')
+
+            for path_in, path_out in [(path_raw, path_raw_masks), (path_deconv, path_deconv_masks)]:
+                
+                if 'deconv' in path_in:
+                    deconv = True
+                    key_dict = 'deconv_iter_'+str(deconv_iter)
+                else:
+                        
+                    deconv = False
+                    key_dict = 'raw'
+                
+                print(key_dict, '************************')    
+                if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
+                    results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
+
+                    if not os.path.exists(path_in):
+                        print(f'  Skipping (file not found): {path_in}')
+                        continue
+                    print(path_in)
+                    with tiff.TiffFile(path_in) as tf:
+                        stack = tf.asarray()
+                        vxy = 1.0 / (tf.pages[0].tags['XResolution'].value[0] / tf.pages[0].tags['XResolution'].value[1])
+                        vz  = tf.imagej_metadata['spacing']
+                    
+                    #stack_proj = stack.sum(axis=0)
+                    stack_proj = stack.sum(axis=0).astype(np.float32)
+
+                    results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack'] = stack
+                    results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack_proj'] = stack_proj
+
+                    for treshold_algorithm in treshold_algorithm_list:
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm] = {}
+                        
+                    
+                        if treshold_algorithm == 'triangle':
+                            thresh = threshold_triangle(stack)
+                            thresh_proj = threshold_triangle(stack_proj)
+                        elif treshold_algorithm == 'otsu':
+                            thresh = threshold_otsu(stack)
+                            thresh_proj = threshold_otsu(stack_proj)
+                        elif treshold_algorithm == 'yen':
+                            thresh = threshold_yen(stack)
+                            thresh_proj = threshold_yen(stack_proj) 
+                        elif treshold_algorithm == 'li':
+                            thresh = fast_threshold_li(stack)
+                            thresh_proj = fast_threshold_li(stack_proj)
+                        elif treshold_algorithm == 'consensus':
+                            all_threshold = []
+                            all_threshold_proj = []
+                            
+                            for i in [k for k in treshold_algorithm_list if k != 'consensus']:
+                                    try:
+                                        r = int(i)
+                                        pass
+                                        
+                                    except ValueError:
+                                        all_threshold.append(results['s_'+str(series)]['c_'+str(channel)][key_dict][i]['threshold'])
+                                        all_threshold_proj.append(results['s_'+str(series)]['c_'+str(channel)][key_dict][i]['threshold_proj'])
+                            
+                            thresh = statistics.median(all_threshold)
+                            thresh_proj = statistics.median(all_threshold_proj)
+                        
+                            
+                            
+                        else:
+                            percentile = int(treshold_algorithm)
+                            thresh = np.percentile(stack, percentile)
+                            thresh_proj = np.percentile(stack_proj, percentile)
+                        
+                    
+
+                        
+                        #stack_flat = stack[stack > 0]
+                        # pct_90 = np.percentile(stack_flat, 90)
+                        # pct_95 = np.percentile(stack_flat, 95)
+                        
+                        # print(f'treshold using {treshold_algorithm} = {thresh}')
+                    
+                        masks  = (stack > thresh).astype(np.uint8)
+                        mask_proj = stack_proj > thresh_proj
+                        
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['threshold'] = thresh
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['threshold_proj'] = thresh_proj
+
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['masks'] = masks
+                        results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['mask_proj'] = mask_proj
+                        
+
+
+                        path_out_al = path_out + '_' + treshold_algorithm + '.tif'
+                        imwrite(path_out_al, masks, imagej=True, resolution=(1/vxy, 1/vxy),
+                                metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+                        
+                        print(f'saved {path_out_al}')
+                    
+                        
             
+            
+            if channel ==  channel_struct:
+                # mb_prob_mask = defining_MB_mask(results, series, channel, deconv_iter)
+                # mb_bin_mask = (mb_prob_mask > 0.7).astype(np.uint8)
+
+                #mb_prob_mask = defining_MB_mask_2(results, series, channel, deconv_iter, 'li')
+                #mb_prob_mask = defining_MB_mask_3(results, series, channel, deconv_iter, prob_threshold=0.5, closing_radius=5)
+                #mb_prob_mask = defining_MB_mask_4(results, series, channel, deconv_iter, prob_threshold=0.5)
                 
-                path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}.tif')
-                path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}_masks')
+                #mb_prob_mask = mb_prob_mask.astype(np.uint8)
+                mb_mask = defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz)
+                results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb'] = mb_mask
+                #results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb_bin'] = mb_bin_mask
 
-                for path_in, path_out in [(path_raw, path_raw_masks), (path_deconv, path_deconv_masks)]:
-                    
-                    if 'deconv' in path_in:
-                        deconv = True
-                        key_dict = 'deconv_iter_'+str(deconv_iter)
-                    else:
-                            
-                        deconv = False
-                        key_dict = 'raw'
-                    
-                    print(key_dict, '************************')    
-                    if not key_dict in results['s_'+str(series)]['c_'+str(channel)]:
-                        results['s_'+str(series)]['c_'+str(channel)][key_dict] = {}
+                path_out_MB_prob = path_deconv_masks + '_mb' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
+                #path_out_MB_bin = path_deconv_masks + '_mb_bin' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
 
-                        if not os.path.exists(path_in):
-                            print(f'  Skipping (file not found): {path_in}')
-                            continue
-                        print(path_in)
-                        with tiff.TiffFile(path_in) as tf:
-                            stack = tf.asarray()
-                            vxy = 1.0 / (tf.pages[0].tags['XResolution'].value[0] / tf.pages[0].tags['XResolution'].value[1])
-                            vz  = tf.imagej_metadata['spacing']
-                        
-                        #stack_proj = stack.sum(axis=0)
-                        stack_proj = stack.sum(axis=0).astype(np.float32)
-    
-                        results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack'] = stack
-                        results['s_'+str(series)]['c_'+str(channel)][key_dict]['stack_proj'] = stack_proj
-
-                        for treshold_algorithm in treshold_algorithm_list:
-                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm] = {}
-                            
-                        
-                            if treshold_algorithm == 'triangle':
-                                thresh = threshold_triangle(stack)
-                                thresh_proj = threshold_triangle(stack_proj)
-                            elif treshold_algorithm == 'otsu':
-                                thresh = threshold_otsu(stack)
-                                thresh_proj = threshold_otsu(stack_proj)
-                            elif treshold_algorithm == 'yen':
-                                thresh = threshold_yen(stack)
-                                thresh_proj = threshold_yen(stack_proj) 
-                            elif treshold_algorithm == 'li':
-                                thresh = fast_threshold_li(stack)
-                                thresh_proj = fast_threshold_li(stack_proj)
-                            else:
-                                percentile = int(treshold_algorithm)
-                                thresh = np.percentile(stack, percentile)
-                                thresh_proj = np.percentile(stack_proj, percentile)
-                            
-                        
-
-                            
-                            #stack_flat = stack[stack > 0]
-                            # pct_90 = np.percentile(stack_flat, 90)
-                            # pct_95 = np.percentile(stack_flat, 95)
-                            
-                            print(f'treshold using {treshold_algorithm} = {thresh}')
-                        
-                            masks  = (stack > thresh).astype(np.uint8)
-                            mask_proj = stack_proj > thresh_proj
-                            
-                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['threshold'] = thresh
-                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['masks'] = masks
-                            results['s_'+str(series)]['c_'+str(channel)][key_dict][treshold_algorithm]['mask_proj'] = mask_proj
-                            
-
-
-                            path_out_al = path_out + '_' + treshold_algorithm + '.tif'
-                            imwrite(path_out_al, masks, imagej=True, resolution=(1/vxy, 1/vxy),
-                                    metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
-                            
-                            print(f'saved {path_out_al}')
-                        
-                            
+                imwrite(path_out_MB_prob, mb_mask, imagej=True, resolution=(1/vxy, 1/vxy),
+                                metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
+            #    imwrite(path_out_MB_bin, mb_bin_mask, imagej=True, resolution=(1/vxy, 1/vxy),
+            #                     metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
                 
-                
-                if channel ==  channel_struct:
-                   # mb_prob_mask = defining_MB_mask(results, series, channel, deconv_iter)
-                   # mb_bin_mask = (mb_prob_mask > 0.7).astype(np.uint8)
-
-                   #mb_prob_mask = defining_MB_mask_2(results, series, channel, deconv_iter, 'li')
-                   #mb_prob_mask = defining_MB_mask_3(results, series, channel, deconv_iter, prob_threshold=0.5, closing_radius=5)
-                   #mb_prob_mask = defining_MB_mask_4(results, series, channel, deconv_iter, prob_threshold=0.5)
-                   
-                   #mb_prob_mask = mb_prob_mask.astype(np.uint8)
-                   mb_mask = defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz)
-                   results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb'] = mb_mask
-                   #results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb_bin'] = mb_bin_mask
-
-                   path_out_MB_prob = path_deconv_masks + '_mb' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
-                   #path_out_MB_bin = path_deconv_masks + '_mb_bin' + '.tif'#path_out + '_' + treshold_algorithm + '.tif'
-
-                   imwrite(path_out_MB_prob, mb_mask, imagej=True, resolution=(1/vxy, 1/vxy),
-                                    metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
-                #    imwrite(path_out_MB_bin, mb_bin_mask, imagej=True, resolution=(1/vxy, 1/vxy),
-                #                     metadata={'spacing': vz, 'unit': 'um', 'axes': 'ZYX'})
-                   
-                   #print(f'saved {path_out_MB_prob}'
+                #print(f'saved {path_out_MB_prob}'
         if do_plot:
-            plot_histograms(results, treshold_algorithm_list, series, channel_list, deconv_iter_list)   
+            plot_histograms(results, treshold_algorithm_list, series, channel_list, deconv_iter)   
         
                             
     return results
 # COLOCALIZATION #####################################################
 
-def plot_histograms(results, treshold_algorithm_list, series, channel_list, deconv_iter_list):
+def plot_histograms(results, treshold_algorithm_list, series, channel_list, deconv_iter):
 
 
     for channel in channel_list:
-        for deconv_iter in deconv_iter_list:
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-            MB_mask = results['s_'+str(series)]['c_2']['deconv_iter_'+str(deconv_iter)]['mb'].astype(bool)
-            stack_deconv = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['stack']
-            stack_raw = results['s_'+str(series)]['c_'+str(channel)]['raw']['stack']
-            masked_deconv_values = stack_deconv[MB_mask]
-            masked_raw_values = stack_raw[MB_mask]
-
-                
-            colors = [cm.tab10(i / len(treshold_algorithm_list)) for i in range(len(treshold_algorithm_list))]
-            
-            # RAW
-            axes[0].hist(stack_raw.ravel(), bins=256, alpha=0.5, color ='blue')
-            axes[0].hist(masked_raw_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
-           
-            for i, thrsh_al in enumerate(treshold_algorithm_list):
-
-                thresh = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['threshold']
-                mask_al = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['masks'].astype(bool)
-                
-                
-                frac_MB = mask_al[MB_mask].mean()
-                frac_al = mask_al.mean()
-                
-
-
-                axes[0].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
-            
-            vmin, vmax = np.percentile(stack_raw.ravel(), [1, 100])
-            axes[0].legend(loc='upper right', title='Thresholds')
-            axes[0].set_title(f'series = {series}, channel = {channel}, raw')
-            axes[0].set_xlim(0,vmax)
-            
+        #for deconv_iter in deconv_iter_list:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        MB_mask = results['s_'+str(series)]['c_2']['deconv_iter_'+str(deconv_iter)]['mb'].astype(bool)
+        stack_deconv = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['stack']
+        stack_raw = results['s_'+str(series)]['c_'+str(channel)]['raw']['stack']
+        masked_deconv_values = stack_deconv[MB_mask]
+        masked_raw_values = stack_raw[MB_mask]
 
             
-            # DECONV
-            axes[1].hist(stack_deconv.ravel(), bins=256, alpha=0.5, color ='blue')
-            axes[1].hist(masked_deconv_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
-            for i, thrsh_al in enumerate(treshold_algorithm_list):
+        colors = [cm.tab10(i / len(treshold_algorithm_list)) for i in range(len(treshold_algorithm_list))]
+        
+        # RAW
+        axes[0].hist(stack_raw.ravel(), bins=256, alpha=0.5, color ='blue')
+        axes[0].hist(masked_raw_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
+        
+        for i, thrsh_al in enumerate(treshold_algorithm_list):
 
-                thresh = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['threshold']
-                mask_al = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['masks'].astype(bool)
-                
-                frac_MB = mask_al[MB_mask].mean()
-                frac_al = mask_al.mean()
-
-                axes[1].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
-            vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
-            axes[1].legend(loc='upper right', title='Thresholds')
-            axes[1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}')
-            axes[1].set_xlim(0,vmax)
-           
-            # # DECONV MB
-            # axes[1,1].hist(masked_deconv_values.ravel(), bins=256)
-            # for i, thrsh_al in enumerate(treshold_algorithm_list):
-
-            #     thresh = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['threshold']
-            #     axes[1,1].axvline(thresh, color=colors[i], linestyle='--', label=thrsh_al)
-            # vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
-            # axes[1,1].legend(loc='upper right', title='Thresholds')
-            # axes[1,1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}, MB mask')
-            # axes[1,1].set_xlim(0,vmax)
+            thresh = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['threshold']
+            mask_al = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['masks'].astype(bool)
             
             
-            
+            frac_MB = mask_al[MB_mask].mean()
+            frac_al = mask_al.mean()
             
 
-            plt.tight_layout()  # Prevents overlapping
-            plt.show()
-    
+
+            axes[0].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
+        
+        vmin, vmax = np.percentile(stack_raw.ravel(), [1, 100])
+        axes[0].legend(loc='upper right', title='Thresholds')
+        axes[0].set_title(f'series = {series}, channel = {channel}, raw')
+        axes[0].set_xlim(0,vmax)
+        
+
+        
+        # DECONV
+        axes[1].hist(stack_deconv.ravel(), bins=256, alpha=0.5, color ='blue')
+        axes[1].hist(masked_deconv_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
+        for i, thrsh_al in enumerate(treshold_algorithm_list):
+
+            thresh = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['threshold']
+            mask_al = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['masks'].astype(bool)
+            
+            frac_MB = mask_al[MB_mask].mean()
+            frac_al = mask_al.mean()
+
+            axes[1].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
+        vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
+        axes[1].legend(loc='upper right', title='Thresholds')
+        axes[1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}')
+        axes[1].set_xlim(0,vmax)
+        
+        # # DECONV MB
+        # axes[1,1].hist(masked_deconv_values.ravel(), bins=256)
+        # for i, thrsh_al in enumerate(treshold_algorithm_list):
+
+        #     thresh = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['threshold']
+        #     axes[1,1].axvline(thresh, color=colors[i], linestyle='--', label=thrsh_al)
+        # vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
+        # axes[1,1].legend(loc='upper right', title='Thresholds')
+        # axes[1,1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}, MB mask')
+        # axes[1,1].set_xlim(0,vmax)
+        
+        
+        
+        
+
+        plt.tight_layout()  # Prevents overlapping
+        plt.show()
+
 
 def compute_colocalization(dict_data, series, chA_n, chA_thrsh_al, chB_n, chB_thrsh_al, deconv_iter, min_val=500, do_plot=True, 
                            MB_restrict=True):
