@@ -265,3 +265,87 @@ The 1.96 comes from the normal distribution — it captures the middle 95% of va
 **CI width depends on:**
 - **n** (number of brains): the main driver. Doubling n roughly halves the CI width on the log scale.
 - **Variability between brains**: if brains give very different ORs, the CI will be wide even with a reasonable n.
+
+---
+
+## Signal-to-noise: is there enough SNR to trust these metrics?
+
+Colocalization metrics are computed on binary masks derived from a threshold. If a channel's threshold doesn't clearly separate real signal from background noise, the "positive" mask is capturing noise, not structure — and every downstream metric (fractions, enrichment, OR) is describing noise co-occurrence, not biology.
+
+This matters most for a **fixed-percentile threshold** (e.g. `np.percentile(stack, 95)`): by construction it always keeps the top 5% of voxels, whether the channel has crisp bright puncta on a clean background or is barely above the noise floor. Mask size alone never tells you whether that cut is meaningful.
+
+### An SNR proxy for percentile-thresholded masks
+
+```python
+def snr_proxy(stack, p95_thresh=None):
+    """(p95 - median) / std of background (voxels <= median)."""
+    stack = np.asarray(stack)
+    median = np.median(stack)
+    if p95_thresh is None:
+        p95_thresh = np.percentile(stack, 95)
+    bg = stack[stack <= median]
+    std_bg = bg.std()
+    return round((p95_thresh - median) / std_bg, 3)
+```
+
+**Rationale for each term:**
+
+- **`median`** — a robust stand-in for the "typical background level." The mean is not used because a stack is mostly background with a small fraction of bright foreground, which drags the mean upward; the median stays anchored to the bulk of the histogram as long as foreground occupies well under 50% of voxels.
+- **`std(bottom 50%)`** — an estimate of pure noise spread that deliberately excludes the brightest half of the stack, so real signal can't inflate it. Using the whole-stack std instead would let the very thing you're trying to detect (bright foreground) contaminate the noise estimate, making every channel look artificially noisier than it is.
+- **`p95 − median`** — how far above typical background the actual mask threshold sits, in raw intensity units.
+- **Dividing by `std(bottom 50%)`** — converts that gap into background-noise standard deviations, analogous to the classic imaging SNR definition `(signal − background) / noise_std`.
+
+**How to read it:** a large value (roughly >5–8) means the threshold sits many background-sigmas above typical noise — the mask is capturing real bright structure. A small value (roughly <2–3) means the cutoff is within a couple of background standard deviations of "typical" — for a roughly Gaussian background, ~2.3% of voxels sit >2σ above the mean by chance alone, so "top 5% brightest" is barely distinguishable from "top 5% noisiest," and colocalization computed on that mask is largely noise-driven.
+
+**Caveat:** this is a ratio computed within a single image, so a pure linear rescaling of pixel values (e.g. a different PMT gain applied uniformly) leaves it unchanged — numerator and background std scale together. It is *not* immune to changes in the underlying noise process itself (e.g. genuinely fewer photons collected, which changes shot-noise statistics rather than just rescaling values).
+
+### Checking whether SNR is confounding a colocalization comparison
+
+Compute `snr_proxy` per channel/sample, take the minimum across the channel pair being compared (`snr_min`, since a joint overlap metric is only as trustworthy as its noisier input channel), and correlate it against OR/enrichment across samples (Spearman, since the relationship need not be linear):
+
+```python
+from scipy.stats import spearmanr
+r, p = spearmanr(df['snr_min'], df['MB_total_odds_ratio'])
+```
+
+A positive correlation here is **ambiguous by itself** — it is equally consistent with two very different explanations:
+
+1. **Real biology, revealed better at high SNR**: the true association differs between samples, and only high-SNR samples measure it accurately.
+2. **Pure noise artifact (attenuation toward the null)**: non-differential misclassification of both channel masks systematically biases OR/enrichment toward 1 as noise increases. If every sample shared the *same* true colocalization, lower-SNR samples would still show a lower measured OR purely from noise — a well-known effect in measurement-error statistics, not specific to this pipeline.
+
+Correlation alone cannot distinguish these.
+
+### Noise-injection calibration: testing the "pure artifact" explanation
+
+To test explanation (2) directly: take the highest-SNR sample (the one trusted most), progressively add synthetic Gaussian noise to its two channels (scaled as multiples of that channel's own background std), and recompute the same mask → OR/enrichment pipeline at each noise level. Because the true underlying image never changes, any change in the measured OR across noise levels is coming from noise alone — this traces out what "colocalization" looks like as a function of SNR when true biology is held perfectly constant.
+
+```python
+def add_gaussian_noise(stack, sigma):
+    if sigma == 0:
+        return stack.astype(np.float32)
+    return stack.astype(np.float32) + np.random.normal(0, sigma, size=stack.shape).astype(np.float32)
+```
+
+Interpolating each real sample's own SNR onto this noise-only curve gives an expected OR — "what this sample's OR would be if it shared the reference's true biology and its lower value were pure artifact." The ratio of the observed OR to this expectation (`excess_ratio`) is the diagnostic:
+
+| `excess_ratio` | Interpretation |
+|---|---|
+| ≈ 1 | Fully consistent with noise-only attenuation — no evidence this sample differs biologically from the reference |
+| > 1 | More colocalization than noise alone predicts at this SNR — evidence of a real signal beyond the artifact |
+| < 1 | Less colocalization than even pure noise would produce — a systematic (not random) explanation is needed: real biological difference, or an unrelated sample-specific issue |
+
+**What this rules out, and what it doesn't:**
+
+- If `excess_ratio` scatters randomly around 1 across samples, the "pure noise" null (explanation 2) is a sufficient explanation — don't read biological meaning into the spread.
+- If `excess_ratio` shows a **systematic, one-sided pattern clustered by animal/sample** (e.g. every subregion of one brain sits well below 1, every subregion of another sits near/above 1), that pattern rules out pure random per-image noise as the explanation — noise degrading a shared signal would scatter independently per image, not consistently by animal. This is evidence that *some* real, systematic difference exists between samples.
+- **It cannot distinguish *what kind* of real difference.** True biological variation between animals and a technical/staining-batch effect (e.g. weaker antibody penetration, different fixation quality — anything that lowers true signal in every channel for that whole prep) produce the identical pattern in this test. Resolving that requires information outside the colocalization pipeline itself (e.g. whether samples were stained in the same batch/session, or an independent quality marker unrelated to the channels being compared).
+
+**Caveat on the noise model:** the calibration adds simple additive Gaussian noise on top of the reference sample's own stack. If gain/laser power are tuned per-sample specifically to avoid saturation (common when raw fluorescence brightness varies a lot between samples), the real degradation in a dim sample is closer to genuine **photon-limited (shot) noise from fewer collected photons** — signal-dependent, not simple additive Gaussian. The calibration is therefore a useful sanity check and rough lower bound on how much noise alone can distort the metric, not an exact model of what a dimmer sample "really" looks like.
+
+### Before comparing conditions (e.g. training groups): check SNR balance first
+
+Averaging colocalization metrics across several biological replicates per condition is the right way to average out animal-to-animal variability. But if gain/laser power are adjusted per-sample, and that adjustment correlates with condition (e.g. one training condition tends to produce dimmer samples, prompting systematically higher gain for that whole group), a between-group comparison can re-measure an SNR difference rather than a true biological one.
+
+Practical check: compute `snr_proxy` per sample and compare its distribution between conditions (e.g. Mann-Whitney U, given typically small n per group) before trusting a group-level OR/enrichment comparison.
+- **Balanced SNR across groups** → proceed with the group comparison; a difference found is harder to explain away as an acquisition artifact.
+- **Unbalanced SNR across groups** → either include SNR as a covariate in the group comparison, or use the noise-corrected `excess_ratio` metric instead of the raw OR/enrichment.
