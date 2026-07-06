@@ -462,7 +462,7 @@ def fast_threshold_li(stack):
     return t_u16 / 65535 * (s_max - s_min) + s_min
 
 
-def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, do_plot = True ):
+def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, do_plot = True):
     print(series_list)
     server = False
     system = platform.system()
