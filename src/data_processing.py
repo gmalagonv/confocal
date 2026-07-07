@@ -487,12 +487,12 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
     results = {}
     
     treshold_algorithm_list =[
-    'triangle',
+   'triangle',
     'otsu',
     'yen',
     'li',
     '95',
-    '98',
+   # '98',
     #'consensus',
     
     ]
@@ -662,7 +662,10 @@ def plot_histograms(results, treshold_algorithm_list, series, channel_list, deco
         MB_mask = results['s_'+str(series)]['c_2']['deconv_iter_'+str(deconv_iter)]['mb'].astype(bool)
         stack_deconv = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['stack']
         stack_raw = results['s_'+str(series)]['c_'+str(channel)]['raw']['stack']
+        
+        print(f'stack_deconv.shape: {stack_deconv.shape}, MB_mask.shape: {MB_mask.shape}, stack_raw.shape: {stack_raw.shape}')
         masked_deconv_values = stack_deconv[MB_mask]
+
         masked_raw_values = stack_raw[MB_mask]
 
             

@@ -13,7 +13,7 @@ Branches stay alive — they are personal workspaces. Neither is deleted automat
 # 1. Before starting work — get latest from main
 git add .
 git commit -m "message"
-git push
+git push carmina-brach
 
 ## Daily workflow (each person)
 
