@@ -432,6 +432,8 @@ def defining_MB_mask_4(results, series, channel, deconv_iter, prob_threshold=0.5
 
 def defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz):
     stack = results['s_'+ str(series)]['c_' + str(channel)]['deconv_iter_' + str(deconv_iter)]['stack']
+    mask = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_' + str(deconv_iter)]['95']['masks']
+
     #stack = results['s_'+ str(series)]['c_' + str(channel)]['raw']['stack']
 
     # sigma in µm, converted to pixels
@@ -451,6 +453,15 @@ def defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz):
 
 
     mb_mask = (blurred > thresh).astype(np.uint8)
+    # DEPURE mb_mask, only keep frames where in the deconvolved mask there is signal
+    for i, frame in enumerate(mask):
+        if frame.sum() == 0 and np.sum(mb_mask[i]) != 0:
+            
+            #print(f"mb_mask's frame {i} should not have signal")
+            mb_mask[i] = mask[i]
+            #print(f'fixed: np.sum(mb_mask[i]) = {np.sum(mb_mask[i])}')
+
+
     return mb_mask
 
 def fast_threshold_li(stack):
@@ -487,10 +498,10 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
     results = {}
     
     treshold_algorithm_list =[
-   'triangle',
-    'otsu',
-    'yen',
-    'li',
+#    'triangle',
+#     'otsu',
+#     'yen',
+#     'li',
     '95',
    # '98',
     #'consensus',
@@ -634,6 +645,7 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
                 
                 #mb_prob_mask = mb_prob_mask.astype(np.uint8)
                 mb_mask = defining_MB_mask_5(results, series, channel, deconv_iter, vxy, vz)
+                
                 results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb'] = mb_mask
                 #results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['mb_bin'] = mb_bin_mask
 
