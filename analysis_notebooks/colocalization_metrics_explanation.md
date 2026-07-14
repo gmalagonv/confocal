@@ -349,3 +349,91 @@ Averaging colocalization metrics across several biological replicates per condit
 Practical check: compute `snr_proxy` per sample and compare its distribution between conditions (e.g. Mann-Whitney U, given typically small n per group) before trusting a group-level OR/enrichment comparison.
 - **Balanced SNR across groups** → proceed with the group comparison; a difference found is harder to explain away as an acquisition artifact.
 - **Unbalanced SNR across groups** → either include SNR as a covariate in the group comparison, or use the noise-corrected `excess_ratio` metric instead of the raw OR/enrichment.
+
+---
+
+## Case study: diagnosing a confounded training-condition comparison
+
+The following is a record of a real multi-session debugging process (2026-06-05/15/25 datasets, 5X vs 1X training, HSP↔Mito colocalization). Kept here because the pitfalls are generic and will recur with any new pooled dataset.
+
+### Interpretation: what the diagnostics actually showed
+
+- **Pinhole size differed by imaging session** (0.209 AU vs ~1.0 AU — a ~5x difference in physical diameter), and this tracked almost perfectly with which training condition was imaged in which session. Detected by tabulating `describe_acquisition()` output across all dates in the pooled dataset (pinhole, voxel size, NA, bit depth side by side) — any acquisition parameter that varies by date rather than by animal is a candidate confound.
+- **Deconvolution reliability differed drastically between those same sessions.** The existing quality-control metric (fraction of frames per scene/channel where post-deconvolution background noise std exceeds 1.5x the pre-deconvolution value) was ~0% at 0.209 AU but a **median of 100%** (essentially every frame flagged) at ~1.0 AU — plausibly because a larger pinhole collects more out-of-focus light, violating the in-focus-blur assumption Richardson-Lucy relies on.
+- **An accidental duplicate scan** (same tissue, nothing deliberately changed) showed an **11x odds-ratio discrepancy on deconvolved data**, shrinking to **~1.2x on raw (undeconvolved) data** — direct evidence that deconvolution, not the acquisition itself, was the dominant source of that instability.
+- Recomputing the whole dataset from raw instead of deconvolved images collapsed odds ratios from an implausible 1.2–77 range down to a far more believable 1.0–2.4. Most of the dramatic "colocalization" signal seen in deconvolved data was very likely a deconvolution artifact (structure fusion from PSF mismatch, since the PSF was never bead-calibrated), not real biology.
+- Even after switching to raw data, the pinhole/session split **persisted, just at a much smaller magnitude** (mean OR 1.10 at 0.209 AU vs 1.58 at ~1.0 AU) — so deconvolution was inflating the effect, but not fabricating the underlying pattern on its own.
+- The observed (not statistically supported) direction, on raw data: 1X-trained animals showed a higher OR than 5X in every subregion tested (alpha, alphaprime, gamma), both pooled across sessions and in the smaller pinhole-matched subset.
+
+### Why no conclusion about training condition could be drawn
+
+- **Confounding.** Pinhole and training condition are nearly collinear in this dataset — only one 5X animal happened to share the pinhole setting used for all 1X animals. No statistical adjustment recovers a clean comparison from data this confounded; it requires new, deconfounded acquisitions.
+- **Power.** Even the best available (pinhole-matched) subset was n=2 vs n=2. A Mann-Whitney test at that sample size cannot reach conventional significance under any arrangement of the data (its minimum achievable p-value is ~0.33) — this is a structural limit, not a "no effect found this time" result.
+- **Subregion splitting made it worse, not better.** Dividing an already-too-small comparison by anatomical subregion (alpha/alphaprime/gamma) shrinks each subgroup's n further, and in the pinhole-matched subset the direction of the effect wasn't even consistent across regions — a sign of noise dominating, not a real region-specific effect.
+- Net result: the data can describe a direction and rough magnitude, but cannot support a statistical claim about whether training condition affects colocalization.
+
+### Conclusions about the pipeline (the genuine, reusable output of this exercise)
+
+1. **Local (in-MB) thresholding is only valid for MB-restricted markers.** Restricting a channel's percentile threshold to `stack[MB_mask]` is correct only when that channel's true positive population is entirely contained in the ROI — true for Mito here (MB-driver-restricted labeling), false for BRP and HSP70 (both expressed throughout the brain). Applying it to a broadly-expressed marker forces a roughly fixed X% of the ROI to be called "positive" regardless of real signal level, destroying the biological variation you're trying to measure — the same flattening effect already visible in `prop_MB_Mito` sitting nearly constant (~0.15–0.17) across every sample in this dataset.
+2. **Deconvolution reliability must be checked per acquisition condition, not assumed constant.** Tabulate the existing flagged-fraction QC metric by session before trusting deconvolved output; it can vary from ~0% to ~100% between sessions using the identical pipeline code.
+3. **When deconvolution reliability is in doubt, prefer raw images for mask/threshold-based analysis.** Validate this choice using any available natural-experiment pairs (duplicate acquisitions, bit-depth pairs) — if raw data reproduces far better than deconvolved data on a known duplicate, that's direct evidence to trust raw over deconvolved until the PSF is properly validated (e.g. bead calibration).
+4. **Use accidental duplicate acquisitions as a free noise-floor calibration.** If a dataset contains even one, compare it against the between-animal spread you're trying to interpret — if the technical noise floor is comparable to or larger than the apparent biological effect, no amount of statistics on the existing data will resolve the question.
+5. **Never assume what a naming convention or scene-name suffix means — check the metadata directly, or ask.** A wrong guess here (in this case, assuming a numeric suffix meant zoom level when it meant bit depth) can send an entire analysis down the wrong path.
+
+### Statistical power for small-n comparisons
+
+Before reporting any group comparison from a small pilot dataset, check explicitly whether the sample size can, even in principle, reach significance:
+
+```python
+from scipy.stats import mannwhitneyu
+u, p = mannwhitneyu(group_a, group_b, alternative='two-sided')
+# with n=2 vs n=2, the minimum achievable p-value is ~0.33 regardless of how
+# cleanly separated the groups are — the test is structurally underpowered,
+# not just "not significant this time"
+```
+
+A rough forward-looking sample size estimate, from an observed (or assumed) effect size:
+
+```python
+import numpy as np
+log_a, log_b = np.log(group_a), np.log(group_b)   # use log scale for OR — see pooling section above
+pooled_sd = np.sqrt(((len(log_a)-1)*log_a.var(ddof=1) + (len(log_b)-1)*log_b.var(ddof=1))
+                     / (len(log_a)+len(log_b)-2))
+d = (log_b.mean() - log_a.mean()) / pooled_sd      # Cohen's d, log scale
+n_per_group = 2 * ((1.96 + 0.84) / d) ** 2         # 80% power, alpha=0.05, two-sided
+```
+
+Treat the resulting n as a rough order-of-magnitude planning number, not a precise target — an effect size estimated from 2-4 animals per group is itself highly unstable. Compute it for a range of plausible effect sizes (the observed one, plus more conservative medium/small ones) rather than a single number.
+
+**A related pitfall: splitting an already-small comparison into subgroups (e.g. by anatomical subregion) makes it worse, not better.** Each subgroup inherits the parent comparison's small n, and subgroup-level "patterns" (e.g. one region showing a bigger apparent gap than another) are usually just which animals happened to land in which subgroup, not a real region-specific effect — especially telling if the direction of the effect isn't even consistent across subgroups in a more tightly-matched subset of the data. If subregion effects matter to the biological question, they belong in the experimental design (e.g. as a within-animal repeated factor, since each animal already contributes multiple regions) rather than as a post-hoc split of an underpowered top-level comparison.
+
+### Reporting a confounded, underpowered comparison (e.g. for a thesis)
+
+When the biological question cannot be answered from the available data — due to confounding, small n, or both — the honest and still-valuable framing is:
+
+1. **State plainly that the comparison is not statistically supportable**, and show why (confound structure, achievable power/significance at the current n).
+2. **Report the observed direction and magnitude as a preliminary/descriptive observation**, explicitly labeled as such, not as a conclusion.
+3. **Present the methodological findings as the actual contribution**: a validated pipeline, and concretely characterized sources of measurement error (acquisition confounds, deconvolution reliability, reproducibility floor) — these are real, demonstrable results in their own right.
+4. **Use the pilot data to design the properly powered follow-up** (matched acquisition settings across conditions, interleaved sessions, deliberate technical replicates, a sample size informed by the power estimate above).
+
+Example framing:
+> "This work establishes a validated pipeline for quantifying [X] colocalization, and identifies [specific confound] as the dominant source of measurement uncertainty in the current dataset. Preliminary data suggest [direction/magnitude], but this cannot be confirmed given [confounding structure; n insufficient for power, estimated at N≈X-Y per group]. These findings directly inform the design of a follow-up study with acquisition parameters held constant across conditions and adequate replication."
+
+Finding and clearly explaining why a plausible-looking effect isn't yet trustworthy is a genuine research skill and a defensible thesis contribution — often more so than an unvalidated positive result.
+
+---
+
+## Future improvements
+
+### Bead-based PSF calibration
+
+The deconvolution pipeline currently relies on a theoretical Gaussian PSF (`σ_xy = 0.21λ/NA`, `σ_z = 0.66λn/NA²`) plus an approximate pinhole correction factor, not a measured PSF. Given the deconvolution reliability problems found in the case study above (concentrated specifically in the ~1.0 AU sessions), bead calibration would let the pinhole correction be replaced with an empirically measured value instead of the current approximation.
+
+**Bead size: 100 nm diameter.** The rule of thumb is that bead diameter should be well below (roughly ≤1/3–1/2 of) the system's diffraction-limited resolution, so the bead approximates a true point source rather than a resolvable object whose own size blurs the measurement. With NA=1.4 and the shortest-wavelength channel here (Alexa488, 519 nm), the theoretical lateral PSF is `σ_xy ≈ 78 nm`, FWHM ≈ 183 nm — a 100 nm bead sits comfortably below that, contributing only a small, usually-ignorable broadening. Smaller beads (e.g. 40 nm) get closer to a true point source but are dimmer, trading calibration accuracy for worse SNR in the calibration measurement itself. 100 nm is the standard compromise used in commercial calibration bead kits.
+
+**Practical recommendations:**
+- Use **TetraSpeck beads** (100 nm, four-color) rather than single-color beads — lets you measure the PSF in all three channels (Alexa488/BRP, Cy5/HSP70, Alexa546/Mito) from one prep, and doubles as a chromatic-registration check across channels.
+- Dilute enough to get well-isolated single beads; a cluster of beads will masquerade as an artificially larger/asymmetric "PSF."
+- Image with the **same objective, immersion oil, and pinhole setting** used for real acquisitions — PSF depends on pinhole, and this project now has two distinct pinhole settings in use across sessions (0.209 AU and ~1.0 AU), so **calibrate at both**, not just one.
+- Sample finely: XY pixel size well below Nyquist for the PSF (e.g. ~30–40 nm/px) and Z-steps of ~50–100 nm, so the bead's 3D profile is actually resolved, not just detected.
+- Fit a 3D Gaussian (or the actual RL PSF model) to the resulting bead stack to extract empirical `sigma_xy_px`/`sigma_z_px` directly, and compare against what the formula + pinhole-factor currently predicts. This would tell definitively whether the ~1.0 AU sessions' deconvolution instability (found in the case study above) is a PSF-mismatch problem or something else.
