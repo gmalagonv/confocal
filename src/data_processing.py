@@ -16,12 +16,13 @@ import matplotlib.cm as cm
 
 from pathlib import Path
 from scipy.ndimage import gaussian_filter, median_filter
-from skimage.restoration import richardson_lucy
+from skimage.restoration import richardson_lucy, unsupervised_wiener
 from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triangle, threshold_yen, threshold_li
 #from skimage.measure import label
 from scipy.ndimage import label, binary_fill_holes, binary_closing, gaussian_filter
 from skimage.morphology import convex_hull_image
 import statistics
+import psfmodels as psfm
 
 def loader2(date,user,split_frames=False, server=False):
     
@@ -1294,12 +1295,12 @@ def describe_acquisition(lif_path, do_print=True):
     return all_scenes
 
 
+def _odd_ceil(sigma):
+    s = max(3, int(np.ceil(sigma * 6)))
+    return s if s % 2 == 1 else s + 1
+
 def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
     """Build a normalized Gaussian PSF kernel. 3D if sigma_z_px is given, else 2D."""
-    def _odd_ceil(sigma):
-        s = max(3, int(np.ceil(sigma * 6)))
-        return s if s % 2 == 1 else s + 1
-
     if sigma_z_px is not None:
         kz, ky, kx = _odd_ceil(sigma_z_px), _odd_ceil(sigma_xy_px), _odd_ceil(sigma_xy_px)
         psf = np.zeros((kz, ky, kx), dtype=np.float64)
@@ -1312,16 +1313,39 @@ def _gaussian_psf(sigma_xy_px, sigma_z_px=None):
         psf = gaussian_filter(psf, sigma=[sigma_xy_px, sigma_xy_px])
     return psf / psf.sum()
 
+def _gibson_lanni_psf(sigma_xy_px, sigma_z_px, vxy, vz, NA, lam_um, ni, ns=1.38, threed=True):
+    """Build a normalized Gibson-Lanni PSF kernel via `psfmodels` (scalar model).
+
+    Kernel array size reuses the same 6*sigma heuristic as `_gaussian_psf` (with
+    sigma taken from the theoretical formulas) so both models are compared at a
+    matched box size. `ns` is the sample refractive index -- distinct from the
+    oil immersion index `ni` (1.518). Biological tissue (~1.33-1.38) is not
+    index-matched to oil; this mismatch is a real depth-dependent spherical
+    aberration that a Gaussian PSF cannot represent at all. This model has no
+    pinhole parameter -- it is a widefield objective/coverslip PSF, not a
+    confocal one -- so the existing `_pinhole_psf_factor` correction still
+    applies on top of it, same as for the Gaussian PSF.
+    """
+    nx = _odd_ceil(sigma_xy_px)
+    nz = _odd_ceil(sigma_z_px) if threed else 1
+    psf = psfm.make_psf(z=nz, nx=nx, dxy=vxy, dz=vz, pz=0.0,
+                         NA=NA, wvl=lam_um, ns=ns, ni=ni, ni0=ni,
+                         model='scalar')
+    if not threed:
+        psf = psf[0]
+    return psf / psf.sum()
+
 def _pinhole_psf_factor(pinhole_au):
     p = min(max(pinhole_au, 0.0), 1.0)
     return 1.0 / np.sqrt(2) + (1.0 - 1.0 / np.sqrt(2)) * p  # 0.707 at 0 AU → 1.0 at 1 AU
 
 
 
-def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, forced2d = False):
+def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, correct_psf = True,  forced2d = False,
+               psf_model='gaussian', algorithm='richardson_lucy'):
     """
     Deconvolve a confocal image using Richardson-Lucy with a theoretical
-    Gaussian PSF derived from the microscope metadata in the .lif file.
+    PSF derived from the microscope metadata in the .lif file.
 
     Parameters
     ----------
@@ -1341,6 +1365,28 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         detection-band midpoint read from the .lif metadata (which can be
         significantly off for wide detection windows). E.g. 519 for Alexa 488,
         573 for Alexa 546, 670 for Cy5.
+    psf_model : 'gaussian' or 'gibson-lanni'
+        PSF used for Richardson-Lucy. 'gaussian' (default) is the original
+        theoretical Gaussian PSF -- output filenames are unchanged from before
+        this parameter existed. 'gibson-lanni' uses the scalar Gibson-Lanni
+        model (via the `psfmodels` package), which has correct diffraction
+        rings/tails and accounts for sample/immersion refractive-index
+        mismatch -- but has no pinhole term, so `_pinhole_psf_factor` is still
+        applied on top of it exactly as for the Gaussian PSF. Output filenames
+        get a '_gibson' suffix so results can be compared side by side against
+        the 'gaussian'-model run without overwriting it.
+    algorithm : 'richardson_lucy' or 'unsupervised_wiener'
+        Deconvolution algorithm. 'richardson_lucy' (default) is the existing
+        iterative algorithm -- output filenames unchanged. 'unsupervised_wiener'
+        is a linear, non-iterative alternative (skimage's Bayesian-regularized
+        Wiener filter -- no `num_iter`/regularization value to tune), useful as
+        a structurally different sanity check against Richardson-Lucy's
+        tendency to amplify noise at high iteration counts. Only supported in
+        2D-per-frame mode (skimage's implementation has no 3D case) -- raises
+        ValueError if combined with 3D deconvolution; pass forced2d=True
+        instead. `num_iter` is ignored when this is 'unsupervised_wiener'.
+        Output filenames get a '_wiener' suffix and drop the iteration count,
+        since it doesn't apply.
 
     Returns
     -------
@@ -1355,6 +1401,21 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     With coarse XY sampling (>0.5 µm/px), σ_xy may be <1 px and the effect
     will be subtle — most visible as reduced lateral blur.
     """
+    if psf_model not in ('gaussian', 'gibson-lanni'):
+        raise ValueError(f"psf_model must be 'gaussian' or 'gibson-lanni', got {psf_model!r}")
+    if algorithm not in ('richardson_lucy', 'unsupervised_wiener'):
+        raise ValueError(f"algorithm must be 'richardson_lucy' or 'unsupervised_wiener', got {algorithm!r}")
+
+    # Sample refractive index for the Gibson-Lanni PSF: the refractive index of
+    # the specimen itself (as opposed to `n`/`ni` below, the oil immersion
+    # index, 1.518). Oil is index-matched to the coverslip glass, but not to
+    # biological tissue -- fixed Drosophila brain tissue is closer to 1.33-1.38.
+    # That mismatch causes real depth-dependent spherical aberration that a
+    # Gaussian PSF has no way to represent (it only ever uses one index, oil,
+    # everywhere). Fixed here rather than exposed as a parameter since it's a
+    # generic tissue assumption, not something derived per-acquisition.
+    GIBSON_LANNI_SAMPLE_RI = 1.38
+
     params = parse_lif_psf_params(lif_path, scene)
     NA  = params['NA']
     n   = params['n']
@@ -1372,7 +1433,11 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     pinhole = pinhole * (0.519 / lam)  # scale by emission wavelength relative to 519 nm reference
 
     print( pinhole, '<------------------ pinhole')
-    factor = _pinhole_psf_factor(pinhole)
+    
+    if correct_psf:
+        factor = _pinhole_psf_factor(pinhole)
+    else:
+        factor = 1.0
     
 
     #print(f"Pinhole size : {pinhole} AU, Factor applied to PSF σ: {factor:.3f}")
@@ -1395,7 +1460,11 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # Nyquist: need σ ≥ 2 px (pixel ≤ σ/2) for the axis to be adequately sampled.
     # If Z is undersampled, fall back to 2D deconvolution applied per frame.
     use_3d_psf = is_3d and (sigma_z_px >= 2.0) and not forced2d
-    
+
+    if algorithm == 'unsupervised_wiener' and use_3d_psf:
+        raise ValueError("algorithm='unsupervised_wiener' has no 3D implementation in skimage; "
+                          "pass forced2d=True to force 2D-per-frame mode.")
+
     if use_3d_psf:
         deconv_type = "3d"
     else:
@@ -1414,15 +1483,23 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
                 
         
         
-        print(f"PSF (ch{channel}): λ={lam*1e3:.0f} nm | "
+        print(f"PSF (ch{channel}, {psf_model}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px) | "
               f"σ_z={sigma_z_um * factor:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
-        psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
+        if psf_model == 'gaussian':
+            psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
+        else:
+            psf = _gibson_lanni_psf(sigma_xy_px, sigma_z_px, vxy, vz, NA, lam, n,
+                                     ns=GIBSON_LANNI_SAMPLE_RI, threed=use_3d_psf)
     else:
-       
-        print(f"PSF 2D (ch{channel}): λ={lam*1e3:.0f} nm | "
+
+        print(f"PSF 2D (ch{channel}, {psf_model}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px)")
-        psf = _gaussian_psf(sigma_xy_px)
+        if psf_model == 'gaussian':
+            psf = _gaussian_psf(sigma_xy_px)
+        else:
+            psf = _gibson_lanni_psf(sigma_xy_px, sigma_z_px, vxy, vz, NA, lam, n,
+                                     ns=GIBSON_LANNI_SAMPLE_RI, threed=False)
 
     def _process(img):
         img = img.astype(np.float64)
@@ -1435,7 +1512,10 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         scale = img.max()
         if scale > 0:
             img /= scale
-        out = richardson_lucy(img, psf, num_iter=num_iter, clip=True)
+        if algorithm == 'richardson_lucy':
+            out = richardson_lucy(img, psf, num_iter=num_iter, clip=True)
+        else:
+            out, _ = unsupervised_wiener(img, psf, clip=True)
         return (out * scale).astype(np.float32)
 
     if is_3d and not use_3d_psf:
@@ -1454,7 +1534,20 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     #new_name = glob_path + 'series_'+ str(scene) +'/'+'channel_'+ str(channel)+'/'+'deconv.tif'
     #name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'    #'s1_ch0_deconv_iter_4.tif
 
-    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type +'_iter_' + str(num_iter) + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
+    # 'gaussian' keeps the original filename (no suffix) for backward compatibility
+    # with existing notebooks/results; 'gibson-lanni' gets '_gibson' so the two
+    # models can be run side by side without overwriting each other.
+    psf_suffix = '' if psf_model == 'gaussian' else '_gibson'
+    # Same idea for algorithm: 'richardson_lucy' keeps the original filename
+    # (including the iteration count); 'unsupervised_wiener' has no iteration
+    # count to report, so that part of the name is dropped instead.
+    if algorithm == 'richardson_lucy':
+        algo_suffix = ''
+        iter_part = '_iter_' + str(num_iter)
+    else:
+        algo_suffix = '_wiener'
+        iter_part = ''
+    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type + psf_suffix + algo_suffix + iter_part + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
     
 
     print(name)
