@@ -16,7 +16,8 @@ import matplotlib.cm as cm
 
 from pathlib import Path
 from scipy.ndimage import gaussian_filter, median_filter
-from skimage.restoration import richardson_lucy, unsupervised_wiener
+from scipy.signal import fftconvolve
+from skimage.restoration import richardson_lucy, unsupervised_wiener, denoise_tv_chambolle
 from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triangle, threshold_yen, threshold_li
 #from skimage.measure import label
 from scipy.ndimage import label, binary_fill_holes, binary_closing, gaussian_filter
@@ -1340,6 +1341,59 @@ def _pinhole_psf_factor(pinhole_au):
     return 1.0 / np.sqrt(2) + (1.0 - 1.0 / np.sqrt(2)) * p  # 0.707 at 0 AU → 1.0 at 1 AU
 
 
+def _flip(arr):
+    """Mirror an N-D array about its center (for RL's correlation step)."""
+    return arr[tuple(slice(None, None, -1) for _ in arr.shape)]
+
+
+def _rl_update(estimate, observed, psf, psf_mirror):
+    """One Richardson-Lucy multiplicative update step (image estimate held vs. fixed PSF)."""
+    conv = np.clip(fftconvolve(estimate, psf, mode='same'), 1e-12, None)
+    correction = fftconvolve(observed / conv, psf_mirror, mode='same')
+    return np.clip(estimate * correction, 0, None)
+
+
+def _center_crop(arr, shape):
+    slices = tuple(slice((f - t) // 2, (f - t) // 2 + t) for f, t in zip(arr.shape, shape))
+    return arr[slices]
+
+
+def _psf_sigma_from_kernel(psf):
+    """Intensity-weighted second-moment sigma of a PSF kernel (equals the true sigma for a Gaussian)."""
+    grids = np.mgrid[tuple(slice(0, s) for s in psf.shape)]
+    centers = [(s - 1) / 2 for s in psf.shape]
+    w = psf / psf.sum()
+    variances = [np.sum(w * (g - c) ** 2) for g, c in zip(grids, centers)]
+    return float(np.sqrt(np.mean(variances)))
+
+
+def _blind_rl(observed, psf_init, num_iter):
+    """Myopic (seeded) blind Richardson-Lucy: alternately refine the image estimate holding
+    the PSF fixed, then refine the PSF holding the image fixed, starting from `psf_init`
+    (the theoretical PSF) rather than a flat guess. Standard alternating-minimization
+    blind deconvolution (Ayers & Dainty 1988), seeded rather than started from scratch
+    since a theoretical PSF estimate is already available.
+    """
+    estimate = observed.copy()
+    psf_est = psf_init.copy()
+    psf_est /= psf_est.sum()
+
+    for _ in range(num_iter):
+        psf_mirror = _flip(psf_est)
+        estimate = _rl_update(estimate, observed, psf_est, psf_mirror)
+
+        # Symmetric update for the PSF: same multiplicative rule with the roles of
+        # "image" and "kernel" swapped, cropped back down to the PSF's support size.
+        conv = np.clip(fftconvolve(estimate, psf_est, mode='same'), 1e-12, None)
+        full_correction = fftconvolve(observed / conv, _flip(estimate), mode='same')
+        psf_est = np.clip(psf_est * _center_crop(full_correction, psf_est.shape), 0, None)
+        s = psf_est.sum()
+        if s > 0:
+            psf_est /= s
+
+    return estimate, psf_est
+
+
 
 def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, correct_psf = True,  forced2d = False,
                psf_model='gaussian', algorithm='richardson_lucy'):
@@ -1365,17 +1419,31 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         detection-band midpoint read from the .lif metadata (which can be
         significantly off for wide detection windows). E.g. 519 for Alexa 488,
         573 for Alexa 546, 670 for Cy5.
-    psf_model : 'gaussian' or 'gibson-lanni'
-        PSF used for Richardson-Lucy. 'gaussian' (default) is the original
-        theoretical Gaussian PSF -- output filenames are unchanged from before
-        this parameter existed. 'gibson-lanni' uses the scalar Gibson-Lanni
-        model (via the `psfmodels` package), which has correct diffraction
-        rings/tails and accounts for sample/immersion refractive-index
-        mismatch -- but has no pinhole term, so `_pinhole_psf_factor` is still
-        applied on top of it exactly as for the Gaussian PSF. Output filenames
-        get a '_gibson' suffix so results can be compared side by side against
-        the 'gaussian'-model run without overwriting it.
-    algorithm : 'richardson_lucy' or 'unsupervised_wiener'
+    psf_model : 'gaussian', 'gibson-lanni', or 'estimate'
+        PSF used for deconvolution (independent of which `algorithm` runs on top
+        of it). 'gaussian' (default) is the original theoretical Gaussian PSF --
+        output filenames are unchanged from before this parameter existed.
+        'gibson-lanni' uses the scalar Gibson-Lanni model (via the `psfmodels`
+        package), which has correct diffraction rings/tails and accounts for
+        sample/immersion refractive-index mismatch -- but has no pinhole term,
+        so `_pinhole_psf_factor` is still applied on top of it exactly as for
+        the Gaussian PSF. Output filenames get a '_gibson' suffix so results can
+        be compared side by side against the 'gaussian'-model run without
+        overwriting it.
+        'estimate' derives σ_xy empirically instead of trusting the theoretical
+        formula: it runs a one-off myopic blind-deconvolution pass (see
+        `_blind_rl`) on a representative frame (the middle Z-frame for a stack),
+        seeded from the theoretical Gaussian PSF, and rebuilds a clean Gaussian
+        kernel from the *recovered* σ_xy -- so whichever `algorithm` you asked
+        for still runs normally, just against an empirically-corrected PSF size
+        instead of the theoretical/pinhole-corrected one. σ_z is left at its
+        theoretical value (the blind estimate is 2D-only). This is a lighter
+        substitute for bead calibration, not a replacement for it -- it corrects
+        PSF *size*, not shape. Only supported in 2D-per-frame mode, same
+        restriction as 'unsupervised_wiener'/'blind_richardson_lucy'. Output
+        filenames get a '_psfest' suffix.
+    algorithm : 'richardson_lucy', 'unsupervised_wiener', 'richardson_lucy_tv', or
+        'blind_richardson_lucy'.
         Deconvolution algorithm. 'richardson_lucy' (default) is the existing
         iterative algorithm -- output filenames unchanged. 'unsupervised_wiener'
         is a linear, non-iterative alternative (skimage's Bayesian-regularized
@@ -1387,6 +1455,23 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         instead. `num_iter` is ignored when this is 'unsupervised_wiener'.
         Output filenames get a '_wiener' suffix and drop the iteration count,
         since it doesn't apply.
+        'richardson_lucy_tv' interleaves each RL update with a Total Variation
+        denoising step (see `TV_WEIGHT` in the function body), which directly
+        suppresses the noise amplification/ringing that plain Richardson-Lucy
+        is prone to, without touching the PSF estimate. Supports 3D the same as
+        plain 'richardson_lucy'. Output filenames get a '_rltv' suffix.
+        'blind_richardson_lucy' is myopic (seeded) blind deconvolution: it
+        alternately refines the image estimate and the PSF itself, starting
+        from the theoretical PSF as an initial guess rather than a flat one --
+        useful when the theoretical PSF (no bead calibration available) may be
+        the wrong shape, not just the wrong size. Only supported in 2D-per-frame
+        mode (alternating PSF estimation in 3D is far more fragile) -- same
+        restriction and ValueError behavior as 'unsupervised_wiener'. Because
+        the PSF itself is being re-estimated, the returned `sigma_xy_px` for
+        this algorithm is the *recovered* sigma (fit from the final estimated
+        PSF, averaged across frames), not the theoretical starting value --
+        compare it against the theoretical sigma to see how much the blind
+        estimate moved. Output filenames get a '_blind' suffix.
 
     Returns
     -------
@@ -1401,10 +1486,11 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     With coarse XY sampling (>0.5 µm/px), σ_xy may be <1 px and the effect
     will be subtle — most visible as reduced lateral blur.
     """
-    if psf_model not in ('gaussian', 'gibson-lanni'):
-        raise ValueError(f"psf_model must be 'gaussian' or 'gibson-lanni', got {psf_model!r}")
-    if algorithm not in ('richardson_lucy', 'unsupervised_wiener'):
-        raise ValueError(f"algorithm must be 'richardson_lucy' or 'unsupervised_wiener', got {algorithm!r}")
+    if psf_model not in ('gaussian', 'gibson-lanni', 'estimate'):
+        raise ValueError(f"psf_model must be 'gaussian', 'gibson-lanni', or 'estimate', got {psf_model!r}")
+    _ALGORITHMS = ('richardson_lucy', 'unsupervised_wiener', 'richardson_lucy_tv', 'blind_richardson_lucy')
+    if algorithm not in _ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {_ALGORITHMS}, got {algorithm!r}")
 
     # Sample refractive index for the Gibson-Lanni PSF: the refractive index of
     # the specimen itself (as opposed to `n`/`ni` below, the oil immersion
@@ -1415,6 +1501,19 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # everywhere). Fixed here rather than exposed as a parameter since it's a
     # generic tissue assumption, not something derived per-acquisition.
     GIBSON_LANNI_SAMPLE_RI = 1.38
+
+    # TV (total variation) regularization weight for algorithm='richardson_lucy_tv'.
+    # Each RL update is followed by a TV-denoising step (skimage's Chambolle solver)
+    # that suppresses noise-like high-frequency oscillations while preserving edges --
+    # this is what directly targets the noise-amplification behavior documented for
+    # plain Richardson-Lucy, rather than adjusting the PSF. `img` is normalized to
+    # max=1 before deconvolution (see `_process` below), so this weight is on that
+    # [0, 1] intensity scale, not raw camera counts -- values in the same ballpark
+    # will behave similarly across channels/datasets. Higher = smoother/less noisy but
+    # more flattening of real fine structure; lower = closer to plain Richardson-Lucy.
+    # 0.02 is a reasonable starting point (skimage's own default for natural images is
+    # 0.1); tune by visual comparison across a couple of values, same as `num_iter`.
+    TV_WEIGHT = 0.02
 
     params = parse_lif_psf_params(lif_path, scene)
     NA  = params['NA']
@@ -1461,9 +1560,32 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # If Z is undersampled, fall back to 2D deconvolution applied per frame.
     use_3d_psf = is_3d and (sigma_z_px >= 2.0) and not forced2d
 
-    if algorithm == 'unsupervised_wiener' and use_3d_psf:
-        raise ValueError("algorithm='unsupervised_wiener' has no 3D implementation in skimage; "
+    if algorithm in ('unsupervised_wiener', 'blind_richardson_lucy') and use_3d_psf:
+        raise ValueError(f"algorithm={algorithm!r} has no 3D implementation; "
                           "pass forced2d=True to force 2D-per-frame mode.")
+    if psf_model == 'estimate' and use_3d_psf:
+        raise ValueError("psf_model='estimate' only supports 2D-per-frame PSF estimation; "
+                          "pass forced2d=True to force 2D-per-frame mode.")
+
+    if psf_model == 'estimate':
+        # One-off myopic blind-deconvolution pass on a representative frame, purely to
+        # get a data-driven σ_xy. Seeded from the theoretical Gaussian PSF so it refines
+        # an existing estimate rather than starting blind. The rest of the function then
+        # proceeds exactly as for psf_model='gaussian', but with this σ_xy instead of the
+        # theoretical/pinhole-corrected one.
+        representative = stack[stack.shape[0] // 2] if is_3d else stack
+        rep = representative.astype(np.float64)
+        rep_local_median = median_filter(rep, size=3)
+        rep_hot_pixels = (rep - rep_local_median) > (5.0 * rep.std())
+        rep[rep_hot_pixels] = rep_local_median[rep_hot_pixels]
+        rep_scale = rep.max()
+        if rep_scale > 0:
+            rep = rep / rep_scale
+        _, psf_est = _blind_rl(rep, _gaussian_psf(sigma_xy_px), num_iter)
+        recovered_sigma_xy_px = _psf_sigma_from_kernel(psf_est)
+        print(f"PSF estimate: recovered σ_xy={recovered_sigma_xy_px:.2f} px "
+              f"(theoretical estimate was {sigma_xy_px:.2f} px)")
+        sigma_xy_px = recovered_sigma_xy_px
 
     if use_3d_psf:
         deconv_type = "3d"
@@ -1486,7 +1608,7 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         print(f"PSF (ch{channel}, {psf_model}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px) | "
               f"σ_z={sigma_z_um * factor:.3f} µm ({sigma_z_px:.2f} px) → {mode}")
-        if psf_model == 'gaussian':
+        if psf_model in ('gaussian', 'estimate'):
             psf = _gaussian_psf(sigma_xy_px, sigma_z_px if use_3d_psf else None)
         else:
             psf = _gibson_lanni_psf(sigma_xy_px, sigma_z_px, vxy, vz, NA, lam, n,
@@ -1495,11 +1617,13 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
 
         print(f"PSF 2D (ch{channel}, {psf_model}): λ={lam*1e3:.0f} nm | "
               f"σ_xy={sigma_xy_um * factor:.3f} µm ({sigma_xy_px:.2f} px)")
-        if psf_model == 'gaussian':
+        if psf_model in ('gaussian', 'estimate'):
             psf = _gaussian_psf(sigma_xy_px)
         else:
             psf = _gibson_lanni_psf(sigma_xy_px, sigma_z_px, vxy, vz, NA, lam, n,
                                      ns=GIBSON_LANNI_SAMPLE_RI, threed=False)
+
+    recovered_sigmas = []  # only populated for algorithm='blind_richardson_lucy'
 
     def _process(img):
         img = img.astype(np.float64)
@@ -1514,14 +1638,30 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
             img /= scale
         if algorithm == 'richardson_lucy':
             out = richardson_lucy(img, psf, num_iter=num_iter, clip=True)
-        else:
+        elif algorithm == 'unsupervised_wiener':
             out, _ = unsupervised_wiener(img, psf, clip=True)
+        elif algorithm == 'richardson_lucy_tv':
+            psf_mirror = _flip(psf)
+            estimate = np.full_like(img, 0.5)
+            for _ in range(num_iter):
+                estimate = _rl_update(estimate, img, psf, psf_mirror)
+                estimate = denoise_tv_chambolle(estimate, weight=TV_WEIGHT)
+            out = estimate
+        else:  # 'blind_richardson_lucy'
+            out, psf_est = _blind_rl(img, psf, num_iter)
+            recovered_sigmas.append(_psf_sigma_from_kernel(psf_est))
         return (out * scale).astype(np.float32)
 
     if is_3d and not use_3d_psf:
         result = np.stack([_process(stack[z]) for z in range(stack.shape[0])])
     else:
         result = _process(stack)
+
+    if algorithm == 'blind_richardson_lucy' and recovered_sigmas:
+        recovered_sigma_xy_px = float(np.mean(recovered_sigmas))
+        print(f"Blind RL recovered σ_xy: {recovered_sigma_xy_px:.2f} px "
+              f"(theoretical estimate was {sigma_xy_px:.2f} px)")
+        sigma_xy_px = recovered_sigma_xy_px
 
     # path deconv image:
     #'gerard/data/confocal/2026_05_26_Gerardo/Project.lif'
@@ -1535,18 +1675,21 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     #name = 's' + str(scene) + '_ch' + str(channel) + '_deconv_iter_' + str(num_iter) + '.tif'    #'s1_ch0_deconv_iter_4.tif
 
     # 'gaussian' keeps the original filename (no suffix) for backward compatibility
-    # with existing notebooks/results; 'gibson-lanni' gets '_gibson' so the two
-    # models can be run side by side without overwriting each other.
-    psf_suffix = '' if psf_model == 'gaussian' else '_gibson'
+    # with existing notebooks/results; the other models get their own suffix so all
+    # three can be run side by side without overwriting each other.
+    psf_suffixes = {'gaussian': '', 'gibson-lanni': '_gibson', 'estimate': '_psfest'}
+    psf_suffix = psf_suffixes[psf_model]
     # Same idea for algorithm: 'richardson_lucy' keeps the original filename
     # (including the iteration count); 'unsupervised_wiener' has no iteration
     # count to report, so that part of the name is dropped instead.
-    if algorithm == 'richardson_lucy':
-        algo_suffix = ''
-        iter_part = '_iter_' + str(num_iter)
-    else:
-        algo_suffix = '_wiener'
-        iter_part = ''
+    algo_suffixes = {
+        'richardson_lucy': '',
+        'unsupervised_wiener': '_wiener',
+        'richardson_lucy_tv': '_rltv',
+        'blind_richardson_lucy': '_blind',
+    }
+    algo_suffix = algo_suffixes[algorithm]
+    iter_part = '' if algorithm == 'unsupervised_wiener' else '_iter_' + str(num_iter)
     name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type + psf_suffix + algo_suffix + iter_part + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
     
 
