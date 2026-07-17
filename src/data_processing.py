@@ -15,7 +15,7 @@ import platform
 import matplotlib.cm as cm
 
 from pathlib import Path
-from scipy.ndimage import gaussian_filter, median_filter
+from scipy.ndimage import gaussian_filter, median_filter, uniform_filter
 from scipy.signal import fftconvolve
 from skimage.restoration import richardson_lucy, unsupervised_wiener, denoise_tv_chambolle
 from skimage.filters import try_all_threshold, threshold_otsu,  threshold_triangle, threshold_yen, threshold_li
@@ -1353,6 +1353,18 @@ def _rl_update(estimate, observed, psf, psf_mirror):
     return np.clip(estimate * correction, 0, None)
 
 
+def _peak_snr(img):
+    """Peak SNR estimate (Laasmaa, Vendelin & Peterson 2011, Eq. 6): for Poisson-distributed
+    photon counts, variance equals the mean, so SNR = mean/std = sqrt(mean). Averages over a
+    local 3-pixel-wide neighborhood (3x3 in 2D, 3x3x3 in 3D) around the brightest region rather
+    than reading a single peak pixel, since one hot/noisy pixel would otherwise dominate the
+    estimate. Scale-invariant (unaffected by max-normalizing `img` first), so it can be
+    computed before or after that step with the same result.
+    """
+    local_mean = uniform_filter(img.astype(np.float64), size=3)
+    return np.sqrt(max(local_mean.max(), 1e-12))
+
+
 def _center_crop(arr, shape):
     slices = tuple(slice((f - t) // 2, (f - t) // 2 + t) for f, t in zip(arr.shape, shape))
     return arr[slices]
@@ -1456,9 +1468,12 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         Output filenames get a '_wiener' suffix and drop the iteration count,
         since it doesn't apply.
         'richardson_lucy_tv' interleaves each RL update with a Total Variation
-        denoising step (see `TV_WEIGHT` in the function body), which directly
-        suppresses the noise amplification/ringing that plain Richardson-Lucy
-        is prone to, without touching the PSF estimate. Supports 3D the same as
+        denoising step, which directly suppresses the noise amplification/ringing
+        that plain Richardson-Lucy is prone to, without touching the PSF estimate.
+        The TV weight is not a fixed constant -- it is derived per frame from that
+        frame's own peak SNR (see `_peak_snr` and `TV_LAMBDA_SNR_COEFFICIENT` in
+        the function body), following the SNR-based estimate in Laasmaa, Vendelin
+        & Peterson (2011, J. Microscopy 243:124-140). Supports 3D the same as
         plain 'richardson_lucy'. Output filenames get a '_rltv' suffix.
         'blind_richardson_lucy' is myopic (seeded) blind deconvolution: it
         alternately refines the image estimate and the PSF itself, starting
@@ -1506,14 +1521,21 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     # Each RL update is followed by a TV-denoising step (skimage's Chambolle solver)
     # that suppresses noise-like high-frequency oscillations while preserving edges --
     # this is what directly targets the noise-amplification behavior documented for
-    # plain Richardson-Lucy, rather than adjusting the PSF. `img` is normalized to
-    # max=1 before deconvolution (see `_process` below), so this weight is on that
-    # [0, 1] intensity scale, not raw camera counts -- values in the same ballpark
-    # will behave similarly across channels/datasets. Higher = smoother/less noisy but
-    # more flattening of real fine structure; lower = closer to plain Richardson-Lucy.
-    # 0.02 is a reasonable starting point (skimage's own default for natural images is
-    # 0.1); tune by visual comparison across a couple of values, same as `num_iter`.
-    TV_WEIGHT = 0.02
+    # plain Richardson-Lucy, rather than adjusting the PSF. Higher = smoother/less
+    # noisy but more flattening of real fine structure; lower = closer to plain
+    # Richardson-Lucy.
+    # Rather than a fixed guessed constant, the weight is derived per frame from
+    # that frame's own peak SNR (`_peak_snr`, Eq. 6 of Laasmaa, Vendelin & Peterson
+    # 2011) using their empirically fit relation lambda_opt ~= 50/SNR (their Fig. 5B,
+    # exponent close to -1 across both textures they tested). This reuses their
+    # data-driven starting estimate, not their full algorithm: their lambda is
+    # derived for a *single joint* RL-TV update (their Eq. 2-3) re-estimated every
+    # iteration from the current estimate's divergence field, whereas this code
+    # keeps the existing alternating RL-then-TV-denoise scheme and skimage's
+    # differently-parameterized `denoise_tv_chambolle(weight=...)` -- so treat this
+    # as a better-than-arbitrary starting point carried over unchanged across
+    # iterations, not a faithful reproduction of their per-iteration estimator.
+    TV_LAMBDA_SNR_COEFFICIENT = 50.0
 
     params = parse_lif_psf_params(lif_path, scene)
     NA  = params['NA']
@@ -1641,11 +1663,13 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
         elif algorithm == 'unsupervised_wiener':
             out, _ = unsupervised_wiener(img, psf, clip=True)
         elif algorithm == 'richardson_lucy_tv':
+            tv_weight = TV_LAMBDA_SNR_COEFFICIENT / _peak_snr(img)
+            print(f"  TV weight (from peak SNR): {tv_weight:.4f}")
             psf_mirror = _flip(psf)
             estimate = np.full_like(img, 0.5)
             for _ in range(num_iter):
                 estimate = _rl_update(estimate, img, psf, psf_mirror)
-                estimate = denoise_tv_chambolle(estimate, weight=TV_WEIGHT)
+                estimate = denoise_tv_chambolle(estimate, weight=tv_weight)
             out = estimate
         else:  # 'blind_richardson_lucy'
             out, psf_est = _blind_rl(img, psf, num_iter)
