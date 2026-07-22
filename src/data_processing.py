@@ -475,7 +475,14 @@ def fast_threshold_li(stack):
     return t_u16 / 65535 * (s_max - s_min) + s_min
 
 
-def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, do_plot = True):
+def thresholding(date, user, series_list, deconv_iter_list, deconv_type = '', channel_struct =2, do_plot = True):
+    
+    
+    if deconv_type == '':
+        deconv_type_string = '_deconv2d_iter_'
+    else:
+        deconv_type_string = deconv_type
+    
     print(series_list)
     server = False
     system = platform.system()
@@ -536,9 +543,12 @@ def thresholding(date, user, series_list, deconv_iter_list, channel_struct =2, d
             
             #for deconv_iter in deconv_iter_list:
             deconv_iter = deconv_iter_list[s]
-                
-            path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}.tif')
-            path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}_deconv2d_iter_{deconv_iter}_masks')
+            #deconv2d_psfest_blind_iter_2
+            #deconv2d_iter_2
+            # _psfest_blind
+
+            path_deconv      = os.path.join(base, f'{date}_s{series}_ch{channel}{deconv_type_string}{deconv_iter}.tif')
+            path_deconv_masks = os.path.join(base, f'{date}_s{series}_ch{channel}{deconv_type_string}{deconv_iter}_masks')
 
             for path_in, path_out in [(path_raw, path_raw_masks), (path_deconv, path_deconv_masks)]:
                 
