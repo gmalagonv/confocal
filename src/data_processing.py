@@ -493,6 +493,11 @@ def plot_histograms(results, treshold_algorithm_list, series, channel_list, deco
 
         colors = [cm.tab10(i / len(treshold_algorithm_list)) for i in range(len(treshold_algorithm_list))]
 
+        # shared x-axis range so raw and deconv histograms are directly comparable
+        _, shared_vmax = np.percentile(
+            np.concatenate([stack_raw.ravel(), stack_deconv.ravel()]), [1, 100]
+        )
+
         # RAW
         axes[0].hist(stack_raw.ravel(), bins=256, alpha=0.5, color ='blue')
         axes[0].hist(masked_raw_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
@@ -510,10 +515,9 @@ def plot_histograms(results, treshold_algorithm_list, series, channel_list, deco
 
             axes[0].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
 
-        vmin, vmax = np.percentile(stack_raw.ravel(), [1, 100])
         axes[0].legend(loc='upper right', title='Thresholds')
         axes[0].set_title(f'series = {series}, channel = {channel}, raw')
-        axes[0].set_xlim(0,vmax)
+        axes[0].set_xlim(0, shared_vmax)
 
 
 
@@ -529,10 +533,9 @@ def plot_histograms(results, treshold_algorithm_list, series, channel_list, deco
             frac_al = mask_al.mean()
 
             axes[1].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
-        vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
         axes[1].legend(loc='upper right', title='Thresholds')
         axes[1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}')
-        axes[1].set_xlim(0,vmax)
+        axes[1].set_xlim(0, shared_vmax)
 
         plt.tight_layout()  # Prevents overlapping
         plt.show()
