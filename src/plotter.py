@@ -7,7 +7,7 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from itertools import combinations
 
 
-def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", figsize=(3,6),
+def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, figsize=(3,6),
                        bar_color="lightgray", dot_color="black", spine_width=2, legend=False):
     """
     Plot multiple groups as bars with SEM and overlay individual data points.
@@ -97,6 +97,8 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", figsize=(3,6),
     # Ticks only on left/bottom
     ax.yaxis.set_ticks_position("left")
     ax.xaxis.set_ticks_position("bottom")
+    if title is not None:
+      ax.set_title(title)
 
     # Add baseline at y = 0
     ax.axhline(0, color="black", linewidth=1.2)
@@ -320,7 +322,7 @@ def cohens_all(list_arrays, list_labels, quiet=False):
 ################################################
 
 
-def fast_plotter(dates,  df=None, figsize=(6,6), bar_color="lightgray", labels = [], quietStats=False, legend=False):
+def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", title=None, bar_color="lightgray", labels = [], quietStats=False, legend=False):
     
 
     vals_arrays = []
@@ -387,7 +389,8 @@ def fast_plotter(dates,  df=None, figsize=(6,6), bar_color="lightgray", labels =
     ax = plot_bars_with_sem3_test(
         vals_arrays,
         labels=labels,
-        ylabel="Performance Index",
+        ylabel=ylabel,
+        title = title, 
         bar_color=bar_color,
         figsize=figsize,
         legend=legend,
