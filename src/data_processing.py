@@ -475,6 +475,69 @@ def fast_threshold_li(stack):
     return t_u16 / 65535 * (s_max - s_min) + s_min
 
 
+def plot_histograms(results, treshold_algorithm_list, series, channel_list, deconv_iter):
+
+
+    for channel in channel_list:
+        #for deconv_iter in deconv_iter_list:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        MB_mask = results['s_'+str(series)]['c_2']['deconv_iter_'+str(deconv_iter)]['mb'].astype(bool)
+        stack_deconv = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)]['stack']
+        stack_raw = results['s_'+str(series)]['c_'+str(channel)]['raw']['stack']
+
+        print(f'stack_deconv.shape: {stack_deconv.shape}, MB_mask.shape: {MB_mask.shape}, stack_raw.shape: {stack_raw.shape}')
+        masked_deconv_values = stack_deconv[MB_mask]
+
+        masked_raw_values = stack_raw[MB_mask]
+
+
+        colors = [cm.tab10(i / len(treshold_algorithm_list)) for i in range(len(treshold_algorithm_list))]
+
+        # RAW
+        axes[0].hist(stack_raw.ravel(), bins=256, alpha=0.5, color ='blue')
+        axes[0].hist(masked_raw_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
+
+        for i, thrsh_al in enumerate(treshold_algorithm_list):
+
+            thresh = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['threshold']
+            mask_al = results['s_'+str(series)]['c_'+str(channel)]['raw'][thrsh_al]['masks'].astype(bool)
+
+
+            frac_MB = mask_al[MB_mask].mean()
+            frac_al = mask_al.mean()
+
+
+
+            axes[0].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
+
+        vmin, vmax = np.percentile(stack_raw.ravel(), [1, 100])
+        axes[0].legend(loc='upper right', title='Thresholds')
+        axes[0].set_title(f'series = {series}, channel = {channel}, raw')
+        axes[0].set_xlim(0,vmax)
+
+
+
+        # DECONV
+        axes[1].hist(stack_deconv.ravel(), bins=256, alpha=0.5, color ='blue')
+        axes[1].hist(masked_deconv_values.ravel(), bins=256, alpha=0.5, color ='red', label='MB masked')
+        for i, thrsh_al in enumerate(treshold_algorithm_list):
+
+            thresh = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['threshold']
+            mask_al = results['s_'+str(series)]['c_'+str(channel)]['deconv_iter_'+str(deconv_iter)][thrsh_al]['masks'].astype(bool)
+
+            frac_MB = mask_al[MB_mask].mean()
+            frac_al = mask_al.mean()
+
+            axes[1].axvline(thresh, color=colors[i], linestyle='--', label=f'{thrsh_al} frac: {frac_al:.2%}, frac MB: {frac_MB:.2%}')
+        vmin, vmax = np.percentile(stack_deconv.ravel(), [1, 100])
+        axes[1].legend(loc='upper right', title='Thresholds')
+        axes[1].set_title(f'series = {series}, channel = {channel}, deconv iter = {deconv_iter}')
+        axes[1].set_xlim(0,vmax)
+
+        plt.tight_layout()  # Prevents overlapping
+        plt.show()
+
+
 def thresholding(date, user, series_list, deconv_iter_list, deconv_type = '', channel_struct =2, do_plot = True):
     
     
