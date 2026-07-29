@@ -50,7 +50,7 @@ def snr_proxy(stack, p95_thresh=None):
 
 
 
-def compute_colocalization(results, series_list, names_list, raw=False, deconv_iter=2, export=True):
+def compute_colocalization(results, series_list, names_list, path_2save, raw=False, deconv_iter=2, export=True):
     #raw = False # <---------------------------------
 
     #series_list = list(range(len(info.keys())))
@@ -148,16 +148,21 @@ def compute_colocalization(results, series_list, names_list, raw=False, deconv_i
                         'MB_syn': SYN_mask,
                         'MB_non_syn' : NON_SYN_mask,
                         }
-            
+
+            overlap_count_by_mask = {}
+            mask_volume_by_mask = {}
+
             for msk in masks2check.keys():
                 #print(msk)
                 MASK = masks2check[msk]
-                
-                
+
+
                 mask_chA_MB = mask_chA & MASK
                 mask_chB_MB = mask_chB & MASK
                 overlap = mask_chA_MB & mask_chB_MB # |A∩B|
-                
+                overlap_count_by_mask[msk] = overlap.sum()
+                mask_volume_by_mask[msk] = MASK.sum()
+
             ############
                 A_and_B  = (mask_chA_MB &  mask_chB_MB).sum()
                 A_not_B  = (mask_chA_MB & ~mask_chB_MB).sum()
@@ -207,6 +212,55 @@ def compute_colocalization(results, series_list, names_list, raw=False, deconv_i
                 table_results[column3].append(float(f'{odds_ratio:.3f}'))
                 table_results[column4].append(float(f'{(observed/expected):.3f}'))
 
+            # SYN_mask and NON_SYN_mask partition MB_total exactly (mutually exclusive,
+            # union == MB_total), so overlap_total == overlap_syn + overlap_non_syn and
+            # these two shares sum to 1.0 -- a real split of where the total A-B overlap
+            # sits, unlike the fraction columns above which are each normalized by their
+            # own local (syn-only or non_syn-only) denominator and so aren't comparable
+            # to each other as absolute amounts.
+            overlap_total = overlap_count_by_mask['MB_total']
+
+            pair_name = f'{channels[str(chA_n)]}-{channels[str(chB_n)]}'
+            column5 = 'MB_syn' + '_' + f'share of total {pair_name} overlap'
+            column6 = 'MB_non_syn' + '_' + f'share of total {pair_name} overlap'
+
+            if column5 not in table_results.keys():
+                table_results[column5] = []
+            if column6 not in table_results.keys():
+                table_results[column6] = []
+
+            if overlap_total > 0:
+                share_syn = overlap_count_by_mask['MB_syn'] / overlap_total
+                share_non_syn = overlap_count_by_mask['MB_non_syn'] / overlap_total
+            else:
+                share_syn = np.nan
+                share_non_syn = np.nan
+
+            table_results[column5].append(float(f'{share_syn:.3f}'))
+            table_results[column6].append(float(f'{share_non_syn:.3f}'))
+
+            # Density: colocalized voxels per voxel of that compartment. Unlike the
+            # share columns above (which split one fixed total across compartments),
+            # density is normalized by each compartment's own volume, so it directly
+            # accounts for SYN_mask being much smaller than NON_SYN_mask -- a small
+            # compartment can have a high density without needing much absolute overlap.
+            column7 = 'MB_syn' + '_' + f'{pair_name} colocalization density'
+            column8 = 'MB_non_syn' + '_' + f'{pair_name} colocalization density'
+
+            if column7 not in table_results.keys():
+                table_results[column7] = []
+            if column8 not in table_results.keys():
+                table_results[column8] = []
+
+            syn_volume = mask_volume_by_mask['MB_syn']
+            non_syn_volume = mask_volume_by_mask['MB_non_syn']
+
+            density_syn = overlap_count_by_mask['MB_syn'] / syn_volume if syn_volume > 0 else np.nan
+            density_non_syn = overlap_count_by_mask['MB_non_syn'] / non_syn_volume if non_syn_volume > 0 else np.nan
+
+            table_results[column7].append(float(f'{density_syn:.4f}'))
+            table_results[column8].append(float(f'{density_non_syn:.4f}'))
+
     df = pd.DataFrame(table_results)
 
 ################# the following part needs to be integrated in the main loop: ineficient.
@@ -237,9 +291,9 @@ def compute_colocalization(results, series_list, names_list, raw=False, deconv_i
     
     if export:
         if raw:
-            path_csv = home + date + '_' + user + '/coloc_results_raw.csv'
+            path_csv = path_2save + '/coloc_results_raw.csv'
         else:
-            path_csv = home + date + '_' + user + '/coloc_results.csv'
+            path_csv = path_2save + '/coloc_results.csv'
         df.to_csv(path_csv, index=False)
     
     return df

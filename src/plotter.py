@@ -2,7 +2,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-from scipy.stats import shapiro, levene, f_oneway
+from scipy.stats import (
+    shapiro, levene, f_oneway,
+    mannwhitneyu, wilcoxon, kruskal, friedmanchisquare, rankdata,
+)
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from itertools import combinations
 
@@ -317,12 +320,164 @@ def cohens_all(list_arrays, list_labels, quiet=False):
       print(f"  Effect size: {size}\n")
 
 
+###### NON-PARAMETRIC STATS #############
+# Used in place of the ANOVA/Tukey/Cohen's-d block above when shapiro_wilk flags
+# non-normal data. `paired=True` means the groups are repeated measurements on the
+# same subjects (e.g. same brains' syn vs non-syn fraction) rather than independent
+# samples, which determines whether the signed-rank or rank-sum family is valid.
+
+def mannwhitneyu_test(list_arrays, quiet=False):
+  """Non-parametric alternative to an independent two-sample t-test."""
+  stat, p_value = mannwhitneyu(list_arrays[0], list_arrays[1], alternative="two-sided")
+  if not quiet:
+    print("Mann-Whitney U test")
+    print(f"U statistic = {stat:.4f}")
+    print(f"p-value     = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant difference between groups\n" if significant
+          else "→ No significant difference detected\n")
+  return significant, p_value
+
+
+def wilcoxon_test(list_arrays, quiet=False):
+  """Non-parametric alternative to a paired t-test."""
+  stat, p_value = wilcoxon(list_arrays[0], list_arrays[1])
+  if not quiet:
+    print("Wilcoxon signed-rank test")
+    print(f"W statistic = {stat:.4f}")
+    print(f"p-value     = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant difference between groups\n" if significant
+          else "→ No significant difference detected\n")
+  return significant, p_value
+
+
+def kruskal_test(list_arrays, quiet=False):
+  """Non-parametric alternative to one-way ANOVA (>2 independent groups)."""
+  stat, p_value = kruskal(*list_arrays)
+  if not quiet:
+    print("Kruskal-Wallis test")
+    print(f"H statistic = {stat:.4f}")
+    print(f"p-value     = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant differences exist between groups\n" if significant
+          else "→ No significant differences detected\n")
+  return significant
+
+
+def friedman_test(list_arrays, quiet=False):
+  """Non-parametric alternative to repeated-measures ANOVA (>2 paired groups)."""
+  stat, p_value = friedmanchisquare(*list_arrays)
+  if not quiet:
+    print("Friedman test")
+    print(f"Chi-square statistic = {stat:.4f}")
+    print(f"p-value               = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant differences exist between groups\n" if significant
+          else "→ No significant differences detected\n")
+  return significant
+
+
+def rank_biserial_effect_size(x, y, quiet=False, label=""):
+  """Effect size for Mann-Whitney U (non-parametric analogue of Cohen's d)."""
+  u_stat, _ = mannwhitneyu(x, y, alternative="two-sided")
+  n1, n2 = len(x), len(y)
+  r = 1 - (2 * u_stat) / (n1 * n2)
+
+  abs_r = abs(r)
+  if abs_r < 0.1:
+    size = "very small"
+  elif abs_r < 0.3:
+    size = "small"
+  elif abs_r < 0.5:
+    size = "medium"
+  else:
+    size = "large"
+
+  if not quiet:
+    prefix = f"{label}\n" if label else ""
+    print(f"{prefix}  Rank-biserial r = {r:.4f}")
+    print(f"  Effect size: {size}\n")
+  return r
+
+
+def matched_pairs_rank_biserial(x, y, quiet=False, label=""):
+  """Effect size for Wilcoxon signed-rank (non-parametric analogue of Cohen's d)."""
+  diffs = np.asarray(x) - np.asarray(y)
+  diffs = diffs[diffs != 0]
+
+  ranks = rankdata(np.abs(diffs))
+  r_plus = ranks[diffs > 0].sum()
+  r_minus = ranks[diffs < 0].sum()
+  r = (r_plus - r_minus) / ranks.sum()
+
+  abs_r = abs(r)
+  if abs_r < 0.1:
+    size = "very small"
+  elif abs_r < 0.3:
+    size = "small"
+  elif abs_r < 0.5:
+    size = "medium"
+  else:
+    size = "large"
+
+  if not quiet:
+    prefix = f"{label}\n" if label else ""
+    print(f"{prefix}  Matched-pairs rank-biserial r = {r:.4f}")
+    print(f"  Effect size: {size}\n")
+  return r
+
+
+def pairwise_nonparametric_posthoc(list_arrays, list_labels, paired=False, quiet=False):
+  """Post-hoc pairwise comparisons for >2 groups, substituting for Tukey HSD.
+
+  Uses Wilcoxon (paired) or Mann-Whitney U (independent) per pair with
+  Holm-Bonferroni correction for multiple comparisons (no extra dependency
+  needed, unlike Dunn's test which would require scikit-posthocs).
+  """
+  pairs = list(combinations(range(len(list_arrays)), 2))
+  raw_pvals = []
+  for i, j in pairs:
+    if paired:
+      _, p = wilcoxon(list_arrays[i], list_arrays[j])
+    else:
+      _, p = mannwhitneyu(list_arrays[i], list_arrays[j], alternative="two-sided")
+    raw_pvals.append(p)
+
+  # Holm-Bonferroni step-down correction
+  m = len(raw_pvals)
+  order = np.argsort(raw_pvals)
+  adj_pvals = [None] * m
+  running_max = 0.0
+  for rank, idx in enumerate(order):
+    adj = min(raw_pvals[idx] * (m - rank), 1.0)
+    running_max = max(running_max, adj)
+    adj_pvals[idx] = running_max
+
+  sig_pairs = []
+  for (i, j), p_adj in zip(pairs, adj_pvals):
+    reject = p_adj < 0.05
+    if not quiet:
+      print(f"{list_labels[i]} vs {list_labels[j]}: p_adj = {p_adj:.4f} "
+            f"{'*' if reject else 'ns'}")
+    if reject:
+      sig_pairs.append((min(i, j), max(i, j), p_adj))
+
+  return sorted(sig_pairs, key=lambda p: p[1] - p[0])
 
 
 ################################################
 
 
-def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", title=None, bar_color="lightgray", labels = [], quietStats=False, legend=False):
+def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", title=None, bar_color="lightgray", labels = [], quietStats=False, legend=False, paired=False):
     
 
     vals_arrays = []
@@ -378,6 +533,26 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", tit
       tukey = tukey_test(vals_arrays, dates, quiet=quietStats)
       cohens_all(vals_arrays, dates, quiet=quietStats)
       sig_pairs = tukey_significant_pairs(tukey, dates)
+
+    elif len(dates) == 2:
+      if paired:
+        significant, p_value = wilcoxon_test(vals_arrays, quiet=quietStats)
+        matched_pairs_rank_biserial(vals_arrays[0], vals_arrays[1], quiet=quietStats)
+      else:
+        significant, p_value = mannwhitneyu_test(vals_arrays, quiet=quietStats)
+        rank_biserial_effect_size(vals_arrays[0], vals_arrays[1], quiet=quietStats)
+
+      if significant:
+        sig_pairs = [(0, 1, p_value)]
+
+    elif len(dates) > 2:
+      if paired:
+        significant = friedman_test(vals_arrays, quiet=quietStats)
+      else:
+        significant = kruskal_test(vals_arrays, quiet=quietStats)
+
+      if significant:
+        sig_pairs = pairwise_nonparametric_posthoc(vals_arrays, dates, paired=paired, quiet=quietStats)
 
 
 
