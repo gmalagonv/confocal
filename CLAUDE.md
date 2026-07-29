@@ -183,6 +183,15 @@ Determined by cross-referencing active lasers with detection bands:
 - σ values at 0.209 AU (formula overestimates): formula gives σ_xy=3.45 px, σ_z=2.03 px for ch0 (Alexa 488); true values ~2.4 px and ~1.4 px respectively → actual PSF is below Nyquist in Z
 - Bleed-through: Alexa 546 → ch0 (MEDIUM); Cy5 → ch2 (LOW)
 
+#### ⚠️ Known batch effect: this session's colocalization metrics run low, not explained by noise or bit depth (found 2026-07-29/30)
+Across the pooled Carmina project (`2026_06_05`, `2026_06_15`, `2026_06_25`, all analyzed via `compute_colocalization` in `src/colocalization.py`), the `2026_06_05` brains (brains 1-3) show `MB_total_enrichment`/`MB_total_odds_ratio` and Pearson r for HSP-Mito **systematically lower** than the other two sessions (e.g. enrichment 1.02–1.16 vs up to 1.9; Pearson r 0.005–0.05 vs up to 0.3), despite having **equal or better** `snr_min_HSP_Mito` values than the other sessions. This was investigated and the low values are **not** an artifact of:
+- **Bit-depth quantization** — down-quantizing a high-bit-depth stack to 8-bit-equivalent (256 levels) had zero-to-opposite effect on Pearson r and enrichment (enrichment went *up*, not down, when quantized — wrong direction to explain the gap).
+- **Measurement noise/SNR** — a noise-injection calibration (add synthetic Gaussian noise to a clean reference brain, rebuild the odds-ratio/enrichment vs. SNR curve, then interpolate each real brain's own SNR onto it) showed the `2026_06_05` brains' *actual* enrichment sits at ~0.67–0.76× what pure noise-only attenuation predicts given their (good) SNR — i.e., they show real, unexplained deficit, not measurement noise.
+
+Most likely cause: a genuine optical effect of the very small (0.209 AU) pinhole itself (different PSF shape/optical sectioning/cross-talk), not simply "noisier data." **Practical consequence: don't pool `2026_06_05` colocalization metrics with the later sessions in a direct comparison** (e.g. 5x vs 1x training) without explicitly flagging/controlling for this — in this project's data, `2026_06_05` happens to be 100% "5x" condition brains, so naive pooling would confound training condition with this batch effect. See `analysis_notebooks/pooled_results.ipynb`.
+
+**Naming gotcha:** in Carmina sample names (e.g. `dec02_5x_brain4alpha_L16new`), the trailing `16` means **16-bit acquisition depth**, not 16x digital zoom — don't assume it matches the `16zoom_*` scene-naming convention used in the 2026-05-26 dataset above, that's a different session with a different naming scheme.
+
 ## Analysis notebooks
 - `analysis_notebooks/` — one notebook per imaging session date (format `YY_MM_DD.ipynb`)
 - Notebooks load functions from `src/data_processing.py`
@@ -297,6 +306,29 @@ M2 = ch2[ch1_mask].sum() / ch2[mask].sum()  # HSP70 signal in mito-positive regi
 
 ### Which to use
 Start with **Pearson R on sum projection** — it is the simplest and captures intensity co-variation directly. Follow up with **Manders** if you want to ask the directional overlap question (e.g., "what fraction of mitochondria are in HSP70-positive regions?" vs "what fraction of HSP70 is on mitochondria?"). Both metrics can be computed in the same pass with minimal extra code.
+
+### Implemented: `compute_colocalization` (src/colocalization.py)
+The plan above evolved into a real function, now used across the whole Carmina project (`2026_06_05`, `2026_06_15`, `2026_06_25`), not just `2026_05_26`. `compute_colocalization(results, series_list, names_list, path_2save, raw=False, deconv_iter=2, export=True)` computes, per brain, for `MB_total` / `MB_syn` (BRP+ within MB) / `MB_non_syn` (BRP− within MB):
+
+| Column pattern | What it answers |
+|---|---|
+| `{msk}_fraction of HSP in Mito` / `{msk}_fraction of Mito in HSP` | Directional Manders-style overlap: `\|A∩B\|/\|A\|` vs `\|A∩B\|/\|B\|` — **not symmetric**, can diverge a lot if the two channels have very different positive-voxel counts in that compartment |
+| `{msk}_odds_ratio`, `{msk}_enrichment` | Chance-corrected overlap (Fisher's exact test; `enrichment = observed/expected` given each channel's own density) — the more rigorous single-number colocalization measure, robust to sparse/punctate signal unlike Pearson r |
+| `{msk}_pearson_r {chA}-{chB}` | Threshold-free, symmetric, continuous-intensity correlation within that compartment's mask |
+| `MB_syn_share of total {pair} overlap` / `MB_non_syn_share of total...` | What fraction of the *total* HSP-Mito overlap (across the whole MB) sits in each compartment — these two sum to 1.0 exactly, since `SYN_mask`/`NON_SYN_mask` partition `MB_mask` |
+| `MB_syn_{pair} colocalization density` / `MB_non_syn_...` | Overlap voxels per voxel of *that compartment* — corrects for `SYN_mask` being much smaller than `NON_SYN_mask`; complements share (share = where the total lives, density = how concentrated it is per unit volume) |
+| `density_HSP_syn`/`_non_syn`, `density_Mito_syn`/`_non_syn` | Same density idea but for a single channel's own signal (not the overlap) — concentration of that channel per unit compartment volume |
+| `prop_MB-HSP_in_syn`, `prop_MB-Mito_in_syn` | Share of a single channel's total MB signal that sits in the synaptic compartment |
+| `snr_min_HSP_Mito` | `min(snr_HSP, snr_Mito)` via `snr_proxy` (background-sigma units) — the weaker channel's SNR bottlenecks the pair. **Caveat: only reliably comparable within one acquisition session** — it's computed from final pixel intensities, so it's sensitive to gain/exposure choices and can look better in a low-signal session if exposure/gain were pushed up to compensate (see the 2026-06-05 batch-effect note above). |
+
+All three `26_06_*_all_b.ipynb` notebooks call this with `deconv_iter=7, raw=False` against `results_deconv_blind_iter7` (blind Richardson-Lucy, 7 iterations — chosen as the best iteration count for this dataset after comparison). `analysis_notebooks/pooled_results.ipynb` pools `coloc_results.csv` across all three Carmina dates, splits by `5x`/`1x` training condition and MB subregion (`alpha_`/`alphaprime_`/`gamma_`) via `df_separator`, and plots with `fast_plotter` (see below).
+
+### Non-parametric stats (src/plotter.py)
+`fast_plotter` originally only ran ANOVA/Tukey/Cohen's d, silently skipping stats entirely when `shapiro_wilk` flagged non-normal data. It now takes a `paired` argument (default `False`) and falls back to the appropriate non-parametric test instead of skipping:
+- 2 groups: `wilcoxon_test` (paired) or `mannwhitneyu_test` (independent), plus matching effect sizes (`matched_pairs_rank_biserial` / `rank_biserial_effect_size`)
+- >2 groups: `friedman_test` (paired) or `kruskal_test` (independent), post-hoc via `pairwise_nonparametric_posthoc` (per-pair Wilcoxon/Mann-Whitney + Holm-Bonferroni correction — a dependency-free substitute for Dunn's test)
+
+Pass `paired=True` when comparing two columns derived from the *same* rows/brains (e.g. `MB_syn_*` vs `MB_non_syn_*` for the same brain) — this is the common case in `pooled_results.ipynb`.
 
 ## Notes
 - `.lif` metadata contains NA, refractive index, voxel sizes, and per-channel spectral bands — always prefer reading from metadata over hardcoding
