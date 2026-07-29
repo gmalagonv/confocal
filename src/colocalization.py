@@ -1,4 +1,4 @@
-from scipy.stats import fisher_exact, spearmanr
+from scipy.stats import fisher_exact, spearmanr, pearsonr
 import pandas as pd
 import numpy as np
 
@@ -50,7 +50,7 @@ def snr_proxy(stack, p95_thresh=None):
 
 
 
-def compute_colocalization(results, series_list, names_list, path_2save, raw=False, deconv_iter=2, export=True):
+def compute_colocalization(results, series_list, names_list, path_2save, raw=False, deconv_iter=2, export=True, name_out='coloc_results'):
     #raw = False # <---------------------------------
 
     #series_list = list(range(len(info.keys())))
@@ -67,6 +67,11 @@ def compute_colocalization(results, series_list, names_list, path_2save, raw=Fal
 
     table_results['prop_MB-HSP_in_syn'] = []
     table_results['prop_MB-Mito_in_syn'] = []
+
+    table_results['density_HSP_syn'] = []
+    table_results['density_HSP_non_syn'] = []
+    table_results['density_Mito_syn'] = []
+    table_results['density_Mito_non_syn'] = []
 
 
     for series in series_list:
@@ -121,12 +126,27 @@ def compute_colocalization(results, series_list, names_list, path_2save, raw=Fal
         prop_MB_HSP_in_syn = (hsp_mask & SYN_mask).sum()/(hsp_mask & MB_mask).sum()
         prop_MB_Mito_in_syn = (mito_mask & SYN_mask).sum()/(mito_mask & MB_mask).sum()
 
+        # Density: channel-positive voxels per voxel of that compartment. The prop_*_in_syn
+        # metrics above are shares of the channel's total signal (share_syn + share_non_syn
+        # sums to 1), so they don't reveal concentration on their own -- SYN_mask is much
+        # smaller than NON_SYN_mask, so density is needed to see whether a channel is packed
+        # more densely per unit volume in one compartment vs the other.
+        density_HSP_syn = (hsp_mask & SYN_mask).sum() / SYN_mask.sum() if SYN_mask.sum() > 0 else np.nan
+        density_HSP_non_syn = (hsp_mask & NON_SYN_mask).sum() / NON_SYN_mask.sum() if NON_SYN_mask.sum() > 0 else np.nan
+        density_Mito_syn = (mito_mask & SYN_mask).sum() / SYN_mask.sum() if SYN_mask.sum() > 0 else np.nan
+        density_Mito_non_syn = (mito_mask & NON_SYN_mask).sum() / NON_SYN_mask.sum() if NON_SYN_mask.sum() > 0 else np.nan
+
         table_results['prop_MB_BRP'].append(float(f'{prop_MB_BRP:.3f}'))
         table_results['prop_MB_HSP'].append(float(f'{prop_MB_HSP:.3f}'))
         table_results['prop_MB_Mito'].append(float(f'{prop_MB_Mito:.3f}'))
 
         table_results['prop_MB-HSP_in_syn'].append(float(f'{prop_MB_HSP_in_syn:.3f}'))
         table_results['prop_MB-Mito_in_syn'].append(float(f'{prop_MB_Mito_in_syn:.3f}'))
+
+        table_results['density_HSP_syn'].append(float(f'{density_HSP_syn:.4f}'))
+        table_results['density_HSP_non_syn'].append(float(f'{density_HSP_non_syn:.4f}'))
+        table_results['density_Mito_syn'].append(float(f'{density_Mito_syn:.4f}'))
+        table_results['density_Mito_non_syn'].append(float(f'{density_Mito_non_syn:.4f}'))
 
 
 
@@ -138,12 +158,16 @@ def compute_colocalization(results, series_list, names_list, path_2save, raw=Fal
             if raw:
                 mask_chA = results['s_'+str(series)]['c_'+str(chA_n)]['raw'][chA_thrsh_al]['masks'].astype(bool)
                 mask_chB = results['s_'+str(series)]['c_'+str(chB_n)]['raw'][chB_thrsh_al]['masks'].astype(bool)
+                stack_chA = results['s_'+str(series)]['c_'+str(chA_n)]['raw']['stack']
+                stack_chB = results['s_'+str(series)]['c_'+str(chB_n)]['raw']['stack']
             else:
                 mask_chA = results['s_'+str(series)]['c_'+str(chA_n)][deconv_str_mask][chA_thrsh_al]['masks'].astype(bool)
                 mask_chB = results['s_'+str(series)]['c_'+str(chB_n)][deconv_str_mask][chB_thrsh_al]['masks'].astype(bool)
-                    
-            
-            
+                stack_chA = results['s_'+str(series)]['c_'+str(chA_n)][deconv_str_mask]['stack']
+                stack_chB = results['s_'+str(series)]['c_'+str(chB_n)][deconv_str_mask]['stack']
+
+
+
             masks2check = {'MB_total': MB_mask,
                         'MB_syn': SYN_mask,
                         'MB_non_syn' : NON_SYN_mask,
@@ -162,6 +186,19 @@ def compute_colocalization(results, series_list, names_list, path_2save, raw=Fal
                 overlap = mask_chA_MB & mask_chB_MB # |A∩B|
                 overlap_count_by_mask[msk] = overlap.sum()
                 mask_volume_by_mask[msk] = MASK.sum()
+
+                # Pearson r on continuous intensities within MASK: a threshold-free,
+                # symmetric, single-number colocalization measure (no mask_chA/mask_chB
+                # binarization involved here, unlike fraction/odds_ratio/enrichment above).
+                if MASK.sum() > 1:
+                    pearson_r, _ = pearsonr(stack_chA[MASK].ravel(), stack_chB[MASK].ravel())
+                else:
+                    pearson_r = np.nan
+
+                column_pearson = msk + '_' + f'pearson_r {channels[str(chA_n)]}-{channels[str(chB_n)]}'
+                if column_pearson not in table_results.keys():
+                    table_results[column_pearson] = []
+                table_results[column_pearson].append(float(f'{pearson_r:.3f}'))
 
             ############
                 A_and_B  = (mask_chA_MB &  mask_chB_MB).sum()
@@ -291,9 +328,10 @@ def compute_colocalization(results, series_list, names_list, path_2save, raw=Fal
     
     if export:
         if raw:
-            path_csv = path_2save + '/coloc_results_raw.csv'
-        else:
-            path_csv = path_2save + '/coloc_results.csv'
+            name_out = name_out + '_raw'
+        path_csv = path_2save + f'/{name_out}.csv'
+        # else:
+        #     path_csv = path_2save + '/coloc_results.csv'
         df.to_csv(path_csv, index=False)
     
     return df
