@@ -43,7 +43,7 @@ On Linux (server): same environment name, activated normally via `conda activate
 | `signal_extractor(mask_path, file_path, ...)` | Extract mean intensity per ROI per Z-frame |
 | `signals(date, user, series_n, masks_suffixes, ...)` | Batch signal extraction for multiple masks/channels |
 | `parse_lif_psf_params(lif_path, scene)` | Read NA, voxel sizes, emission wavelengths from `.lif` metadata |
-| `deconvolve(stack, lif_path, channel, scene, num_iter, emission_nm)` | Richardson-Lucy deconvolution; returns `(result, sigma_xy_px)` |
+| `deconvolve(stack, lif_path, channel, scene, num_iter, emission_nm, correct_psf, forced2d, psf_model, algorithm)` | Deconvolution with selectable PSF model and algorithm (see Deconvolution section); returns `(result, sigma_xy_px)` |
 | `plot_bars_with_sem3(groups, labels, ...)` | Bar plot with SEM and overlaid data points |
 | `raw_values(series_n)` | Raw mean intensities for 2025_11_29 dataset (hardcoded paths) |
 | `basic_ratios(series_n)` | AL-normalized ratios for 2025_11_29 dataset (hardcoded paths) |
@@ -53,16 +53,25 @@ On Linux (server): same environment name, activated normally via `conda activate
 - **`deconvolve`**: Added `emission_nm` parameter (float, nm) to override metadata-derived wavelength — useful when detection bands are wide and the midpoint is far from the true fluorophore peak. Now returns a **tuple** `(result, sigma_xy_px)` instead of just `result`.
 - **`parse_lif_psf_params`**: Now uses `DyeName` field from `.lif` metadata to look up the true fluorophore emission peak (via a hardcoded `_dye_emission` dict) instead of always using the detection-band midpoint. Falls back to midpoint when `DyeName` is absent or unrecognised. Also reworked to parse per `ATLConfocalSettingDefinition` block (one per acquisition sequence), which correctly handles sequential acquisitions where the same detector channel number is reused for different dyes. Sequences with >2 simultaneous lasers are skipped (live-view/alignment scans). Sequences are sorted by minimum active laser wavelength before flattening into the channel list.
 
+#### Recent function changes (2026-07-30)
+- **`deconvolve`**: Gained two independent selectors, `psf_model` and `algorithm`, plus a `correct_psf` toggle for the pinhole-factor correction (default `True`, matches prior always-on behavior).
+  - `psf_model`: `'gaussian'` (default, unchanged) | `'gibson-lanni'` (scalar Gibson-Lanni model via the `psfmodels` package — correct diffraction rings/tails and sample/immersion refractive-index mismatch; has no pinhole term of its own, so `_pinhole_psf_factor` is still applied on top exactly as for Gaussian; sample refractive index fixed internally at 1.38, typical fixed biological tissue, distinct from the oil immersion index 1.518) | `'estimate'` (empirically recovers σ_xy via a one-off myopic blind-deconvolution pass on a representative frame instead of trusting the theoretical formula — a lighter substitute for bead calibration that corrects PSF *size*, not shape; 2D-per-frame only)
+  - `algorithm`: `'richardson_lucy'` (default, unchanged) | `'unsupervised_wiener'` (linear, non-iterative `skimage` Wiener filter — no `num_iter`/regularization to tune; 2D-per-frame only, no 3D implementation in `skimage`) | `'richardson_lucy_tv'` (RL alternated with Total Variation denoising to suppress the noise amplification plain RL is prone to; the TV weight is *not* a fixed constant — it's derived per frame from that frame's own peak SNR via `_peak_snr`, using the SNR-based estimate `weight ≈ 50/SNR` from Laasmaa, Vendelin & Peterson 2011, *J. Microscopy* 243:124–140 — reuses their empirical starting-point relationship, not their full per-iteration joint update/stopping criterion) | `'blind_richardson_lucy'` (myopic/seeded blind deconvolution, alternately refines image and PSF starting from the theoretical PSF; 2D-per-frame only; **this is the production choice for the Carmina project at `num_iter=7`**, see Colocalization section below)
+  - `'unsupervised_wiener'`, `'blind_richardson_lucy'`, and `psf_model='estimate'` all only support 2D-per-frame mode — combining any with 3D deconvolution raises `ValueError` (pass `forced2d=True`)
+  - Output filenames now get suffixes reflecting non-default choices (`_gibson`/`_psfest` for `psf_model`, `_wiener`/`_rltv`/`_blind` for `algorithm`) so different combinations can be compared side by side without overwriting each other; the original defaults (`psf_model='gaussian'`, `algorithm='richardson_lucy'`) keep the unsuffixed filename for backward compatibility with existing notebooks/results.
+  - For `algorithm='blind_richardson_lucy'` or `psf_model='estimate'`, the returned `sigma_xy_px` is the *recovered* sigma (fit from the final estimated PSF), not the theoretical one — compare against the theoretical value to see how far the blind estimate moved.
+  - New helpers: `_gibson_lanni_psf`, `_peak_snr`, `_blind_rl`, `_psf_sigma_from_kernel`, `_rl_update`, `_flip`, `_center_crop`.
+
 ## Deconvolution
-- Algorithm: Richardson-Lucy (`skimage.restoration.richardson_lucy`)
-- PSF: Gaussian, parameters derived from `.lif` metadata
-- PSF formulas: `σ_xy = 0.21 × λ / NA`, `σ_z = 0.66 × λ × n / NA²`
+- Algorithm: selectable via `algorithm` (see above) — `'richardson_lucy'` (default), `'unsupervised_wiener'`, `'richardson_lucy_tv'`, or `'blind_richardson_lucy'`
+- PSF: selectable via `psf_model` (see above) — `'gaussian'` (default, theoretical formula below), `'gibson-lanni'`, or `'estimate'`
+- PSF formulas (theoretical baseline — used directly by `'gaussian'`, and as the seed for `'estimate'`/`'blind_richardson_lucy'`): `σ_xy = 0.21 × λ / NA`, `σ_z = 0.66 × λ × n / NA²`
 - **Nyquist-based mode selection** (automatic): if `σ_z_px ≥ 2` → 3D deconvolution; if `σ_z_px < 2` (Z undersampled) → 2D Richardson-Lucy applied per frame using XY PSF only. Nyquist criterion: pixel ≤ σ/2, i.e. σ/pixel ≥ 2.
 - Hot pixel removal: selective median filter (only replaces pixels > 5× std above local median)
 - Output: `float32`, saved as ImageJ-compatible TIFF with voxel size metadata
 - Accepts both full ZYX stacks and single 2D frames
-- `num_iter=15` default; use 5–10 for a first check, 10–30 typical range
-- **Return value**: `(result, sigma_xy_px)` — the deconvolved array and the XY PSF sigma in pixels (useful for quality checks)
+- `num_iter=15` default; use 5–10 for a first check, 10–30 typical range; ignored when `algorithm='unsupervised_wiener'`
+- **Return value**: `(result, sigma_xy_px)` — the deconvolved array and the XY PSF sigma in pixels (useful for quality checks); see the recovered-sigma caveat above for blind algorithms
 
 ### Pinhole size and PSF calibration
 The PSF formulas (`σ_xy = 0.21λ/NA`, `σ_z = 0.66λn/NA²`) are calibrated for approximately **1 Airy Unit (AU)** pinhole. Actual pinhole size changes the PSF shape — not just brightness:

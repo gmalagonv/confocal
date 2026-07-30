@@ -83,8 +83,8 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
        ax.set_xticklabels([""] * n_groups)
        handles = [Patch(facecolor=c, edgecolor="black", label=l)
                   for c, l in zip(bar_colors, labels)]
-       ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.15),
-                 ncol=1)
+       ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.05),
+                 ncol=2,fontsize=14)
     else:
        ax.set_xticklabels(labels, rotation=angle)
 
@@ -101,7 +101,8 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
     ax.yaxis.set_ticks_position("left")
     ax.xaxis.set_ticks_position("bottom")
     if title is not None:
-      ax.set_title(title)
+      ax.set_title(title, fontsize=14, pad=30)
+
 
     # Add baseline at y = 0
     ax.axhline(0, color="black", linewidth=1.2)
@@ -580,7 +581,8 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", tit
     data_min = min(v.min() for v in vals_arrays)
     bottom = data_min - 0.05 if data_min < 0 else 0
     top = data_max + 0.1 + bar_step * len(sig_pairs)
-    ax.set_ylim(bottom, top)
+    #ax.set_ylim(bottom, top)
+    ax.set_ylim(0, 0.35)
     ax.tick_params(axis="both", labelsize=14)
     ax.yaxis.label.set_size(16)
 
