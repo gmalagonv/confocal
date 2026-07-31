@@ -114,6 +114,24 @@ Interpretation: most HSP70 puncta sit on mitochondria (high fraction of HSP in M
 
 ---
 
+### Density: single-channel voxel occupancy
+
+Not a joint two-channel metric like the three above — `density_HSP_syn`, `density_Mito_non_syn` etc. ask a simpler question about *one* channel at a time: what fraction of a given compartment's voxels are positive for that channel?
+
+```python
+density_HSP_syn = (hsp_mask & SYN_mask).sum() / SYN_mask.sum()
+```
+
+**This is not a physical density.** No physical unit is involved — both numerator and denominator are voxel counts from the same image, so the ratio is a dimensionless occupancy/coverage fraction (0 to 1), not a concentration (e.g. molecules/µm³) or an object count (e.g. puncta/µm³). It also carries no intensity information: a voxel counts as "1" if it crosses the mask threshold, regardless of how far above threshold it sits, so two regions with very different absolute brightness but the same fraction of voxels crossing threshold give identical density values.
+
+**Units: voxels, not pixels.** These masks come from full 3D Z-stacks (`ZYX`), so each unit being counted is a 3D volume element (voxel — with a physical volume set by the acquisition's X×Y×Z voxel size), not a 2D picture element (pixel, no thickness).
+
+**A useful invariance:** because numerator and denominator are both voxel counts from the *same* image, the physical volume of one voxel cancels out of the ratio — this metric stays comparable across sessions/acquisitions with different voxel sizes (e.g. different Z-step), unlike a raw voxel count would.
+
+**Relationship to `prop_MB_*`:** `density_HSP_syn`/`density_HSP_non_syn` are the same calculation as `prop_MB_HSP`, just restricted to the synaptic/non-synaptic sub-compartment instead of the whole MB — together they show how the whole-MB occupancy splits between the two compartments.
+
+---
+
 ## Pooling data across replicates
 
 ### Experimental structure
@@ -127,6 +145,27 @@ Measurements are nested: multiple brain regions within each brain, multiple brai
 | Alpha vs gamma within the same brain | No — same animal, but answers a different biological question |
 
 **Rule:** left and right hemisphere versions of the same region are pseudoreplicates — average them within each brain first, then treat each brain as one data point. Different region types (alpha, gamma, alpha prime) are kept separate; they answer different questions and can be compared as a region effect.
+
+### Comparing two factors at once: mixed paired/unpaired designs
+
+A common case: you want to compare two compartments (e.g. synaptic vs non-synaptic) *and* two conditions (e.g. two training groups) in the same figure — four groups total. The independence structure is now mixed, not uniform:
+
+- **Within a condition, the two compartments are paired** — both computed from the same animal/image.
+- **Across conditions, samples are independent** — different animals.
+
+A single statistical test can't reflect both at once. Naively running one test across all four groups picks the wrong structure either way:
+- Treating all four as **paired** (e.g. repeated-measures/Friedman) assumes every value in a row comes from the same subject — false, since the two conditions are different animals.
+- Treating all four as **independent** (e.g. one-way ANOVA/Kruskal-Wallis) ignores the real within-animal pairing between the two compartments.
+
+**The fix: only test the comparisons that are actually meaningful and correctly matched, individually:**
+- **Compartment A vs compartment B, within condition 1** — paired test (Wilcoxon signed-rank / paired t-test).
+- **Compartment A vs compartment B, within condition 2** — paired test.
+- **Condition 1 vs condition 2, at compartment A** — unpaired test (Mann-Whitney U / independent t-test).
+- **Condition 1 vs condition 2, at compartment B** — unpaired test.
+
+That's 4 of the 6 possible pairwise comparisons among 4 groups — the remaining 2 (e.g. condition-1-compartment-A vs condition-2-compartment-B) mix both factors at once and don't answer a single, well-posed question, so they're best left untested rather than added as extra multiple-comparison noise.
+
+**Caveat carried over from "Experimental structure" above:** each of these four groups must itself already be de-duplicated to one value per animal (hemispheres/regions averaged first) before running any of these tests — if a group is actually dominated by one animal's multiple regions, the four tests above don't fix that. See the case study below for a concrete example of this being knowingly accepted (not fixed) in a preliminary analysis of this project's own data.
 
 ### How to pool each metric
 
@@ -170,6 +209,16 @@ or_val = (a * d) / (b * c)
 ```
 
 **Flag extreme ORs** (e.g. > 500): these usually mean one contingency table cell is near zero, often in a small sub-region. Check the raw counts before including them in the pooled mean — they will dominate log-OR averages.
+
+#### Reading a log(OR) plot in practice
+
+- **Zero is the reference, not an arbitrary baseline** — `log(OR=1) = 0`, and OR=1 means "no association beyond chance." Read each bar relative to zero:
+  - **Above 0** → OR > 1 → more co-occurrence than chance in that group/compartment.
+  - **At/near 0**, especially if the SEM error bar crosses zero → not distinguishable from independence, regardless of what any other bar shows.
+  - **Below 0** → OR < 1 → less overlap than chance predicts (active exclusion, a different story from "no association").
+- **Converting a bar height back to an actual OR**: `OR = exp(log(OR))`. Report *this* number in text/results, not the log value — the log scale is for the plot and the statistics, not for reporting.
+- **Reading the gap between two bars**: subtracting two log(OR) values gives `log(OR_a / OR_b)` — a **ratio**, not a difference in absolute strength. A gap of 0.7 between two bars means one OR is `e^0.7 ≈ 2.0×` the other, not "0.7 units" stronger.
+- **What a significance bracket between two bars does and doesn't tell you**: it tells you those two groups' OR values reliably differ from each other. It does **not** tell you whether either one individually is significantly above chance (OR ≠ 1) — that's a separate question, answered by whether each bar (with its SEM) sits clearly away from the zero line.
 
 ### Should you exclude replicates with enrichment ≈ 1?
 
