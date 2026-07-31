@@ -15,6 +15,12 @@ Always use the `leica-env` conda environment:
 ```
 Key packages: `aicsimageio`, `tifffile`, `scipy`, `scikit-image`, `numpy`, `matplotlib`.
 
+`psfmodels` (for `deconvolve(..., psf_model='gibson-lanni')`) is **pip-only, not on conda-forge** — `conda install psfmodels` fails. Install with:
+```
+/Users/gerard/miniforge3/envs/leica-env/bin/pip install psfmodels
+```
+Ships a prebuilt wheel on macOS arm64 (cp311), no compiler needed.
+
 On Linux (server): same environment name, activated normally via `conda activate leica-env`.
 
 ## Data layout
@@ -61,6 +67,11 @@ On Linux (server): same environment name, activated normally via `conda activate
   - Output filenames now get suffixes reflecting non-default choices (`_gibson`/`_psfest` for `psf_model`, `_wiener`/`_rltv`/`_blind` for `algorithm`) so different combinations can be compared side by side without overwriting each other; the original defaults (`psf_model='gaussian'`, `algorithm='richardson_lucy'`) keep the unsuffixed filename for backward compatibility with existing notebooks/results.
   - For `algorithm='blind_richardson_lucy'` or `psf_model='estimate'`, the returned `sigma_xy_px` is the *recovered* sigma (fit from the final estimated PSF), not the theoretical one — compare against the theoretical value to see how far the blind estimate moved.
   - New helpers: `_gibson_lanni_psf`, `_peak_snr`, `_blind_rl`, `_psf_sigma_from_kernel`, `_rl_update`, `_flip`, `_center_crop`.
+
+#### Recent function changes (2026-07-31)
+- **`plot_histograms`** (called by `thresholding(..., do_plot=True)`) was accidentally deleted in commit `d34d2fe` while its caller kept referencing it — `do_plot=True` silently raised `NameError` since that commit. Restored unchanged, then improved: raw and deconvolved histogram panels now share the same x-axis (`shared_vmax`, the 1st/100th percentile of both stacks combined) instead of each autoscaling independently, so threshold placement is now visually comparable between the two panels.
+- **`plotter.py`**: `fast_plotter` and `plot_bars_with_sem3_test` gained a `pattern` parameter (hatch pattern per bar — `''`/`'///'` etc., same repeat-to-fit convention as `bar_color`), matching what `plot_bars_with_sem3` already supported. Lets a plot encode two grouping variables at once (e.g. color = condition, hatch = compartment) while still getting `fast_plotter`'s automatic significance testing. Legend swatches (`legend=True`) now render with the matching hatch too, not just color.
+- **Bug fix in `fast_plotter`**: a leftover hardcoded `ax.set_ylim(0, 0.35)` was unconditionally overriding the correctly-computed dynamic y-limit (and any explicit `ylim=` argument) right after it was set — this is why significance brackets could render above the visible axis. Removed; `ylim` now actually takes effect.
 
 ## Deconvolution
 - Algorithm: selectable via `algorithm` (see above) — `'richardson_lucy'` (default), `'unsupervised_wiener'`, `'richardson_lucy_tv'`, or `'blind_richardson_lucy'`
@@ -204,6 +215,7 @@ Most likely cause: a genuine optical effect of the very small (0.209 AU) pinhole
 ## Analysis notebooks
 - `analysis_notebooks/` — one notebook per imaging session date (format `YY_MM_DD.ipynb`)
 - Notebooks load functions from `src/data_processing.py`
+- **`analysis_notebooks/colocalization_metrics_explanation.md`** — the authoritative methods/history doc for the colocalization pipeline. Covers metric definitions (fractions, OR, enrichment, Pearson r), pooling rules (log scale for OR, paired vs unpaired, pseudoreplication/unit-of-analysis), the SNR proxy and noise-injection calibration, a "local vs global thresholding" rule (local-to-ROI thresholding is only valid for ROI-restricted markers like Mito here, not broadly-expressed ones like BRP/HSP), the full pinhole/deconvolution-reliability case study behind the `deconv_iter=7` choice above, a bead-calibration "future improvements" section (100 nm beads, calibrate separately per pinhole setting), and guidance on reporting a confounded/underpowered preliminary comparison. Check this before extending the colocalization analysis or re-deriving something already investigated here.
 
 ### `26_06_05_gerardo.ipynb` — deconvolution testing on 2026_06_05_Carmina data
 Tests RL deconvolution across all 10 scenes, 3 channels, multiple iteration counts (2, 4, 6, 10, 15, 20), comparing automatic mode vs `forced2d=True`. Uses parallelized approach (joblib threading). Key finding: at 0.209 AU pinhole, 3D mode causes boundary artifacts and structure fusion even at 2 iterations; `forced2d=True` with ≤ 4 iterations is more appropriate for this dataset.
@@ -330,7 +342,13 @@ The plan above evolved into a real function, now used across the whole Carmina p
 | `prop_MB-HSP_in_syn`, `prop_MB-Mito_in_syn` | Share of a single channel's total MB signal that sits in the synaptic compartment |
 | `snr_min_HSP_Mito` | `min(snr_HSP, snr_Mito)` via `snr_proxy` (background-sigma units) — the weaker channel's SNR bottlenecks the pair. **Caveat: only reliably comparable within one acquisition session** — it's computed from final pixel intensities, so it's sensitive to gain/exposure choices and can look better in a low-signal session if exposure/gain were pushed up to compensate (see the 2026-06-05 batch-effect note above). |
 
-All three `26_06_*_all_b.ipynb` notebooks call this with `deconv_iter=7, raw=False` against `results_deconv_blind_iter7` (blind Richardson-Lucy, 7 iterations — chosen as the best iteration count for this dataset after comparison). `analysis_notebooks/pooled_results.ipynb` pools `coloc_results.csv` across all three Carmina dates, splits by `5x`/`1x` training condition and MB subregion (`alpha_`/`alphaprime_`/`gamma_`) via `df_separator`, and plots with `fast_plotter` (see below).
+All three `26_06_*_all_b.ipynb` notebooks call this with `deconv_iter=7, raw=False` against `results_deconv_blind_iter7` (blind Richardson-Lucy, 7 iterations — chosen from a reproducibility sweep across iterations 2/4/6/7/8/9/10 on two natural-experiment pairs already present in the data: a same-tissue bit-depth pair and an accidental duplicate scan. 7-8 iterations minimize the discrepancy between the two members of each pair; plain Gaussian-PSF RL at iteration 2 was catastrophic on the duplicate pair (11x discrepancy) vs ~1.1-1.2x for blind RL or raw. Full methodology and numbers: `analysis_notebooks/colocalization_metrics_explanation.md`, "Case study" section).
+
+**`analysis_notebooks/pooled_results.ipynb`** pools `coloc_results.csv` across all three Carmina dates, splits by `5x`/`1x` training condition and MB subregion (`alpha_`/`alphaprime_`/`gamma_`) via `df_separator`, and plots with `fast_plotter`/`plot_bars_with_sem3` (see below). Contains:
+- **Density bar plots** (`density_HSP_syn`/`_non_syn`, `density_Mito_syn`/`_non_syn`): fraction of voxels positive per compartment (an occupancy fraction, not a physical density — y-axis labeled accordingly, titles keep "Density" in quotes for this reason).
+- **Synapse-vs-non-synapse comparison, 4 metrics** (fraction of HSP in Mito, fraction of Mito in HSP, odds ratio (log scale), enrichment), in two versions:
+  - **5x only**, paired Wilcoxon (`fast_plotter(..., paired=True)`) — syn/non_syn come from the same animal.
+  - **5x and 1x side by side** (4 bars: condition = color, compartment = hatch pattern) — needs a **mixed** statistical design `fast_plotter` can't express with a single `paired` flag (paired within-condition since same animals; unpaired across-condition since different animals). Implemented via a custom `plot_condition_compartment` helper that runs exactly 4 targeted tests (2 paired Wilcoxon, 2 unpaired Mann-Whitney) and skips the other 2 possible cross-pairs as not biologically meaningful. **Known limitation, accepted for this preliminary analysis**: the unpaired cross-condition tests use region/hemisphere rows as the unit of analysis (5x: n=7 rows from 2 animals, 6 of them from one animal; 1x: n=12 rows from 2 animals, 6 each) rather than true independent animals (real n=2 vs n=2) — flagged explicitly in the notebook markdown, not fixed, since the underlying sample is genuinely this small right now.
 
 ### Non-parametric stats (src/plotter.py)
 `fast_plotter` originally only ran ANOVA/Tukey/Cohen's d, silently skipping stats entirely when `shapiro_wilk` flagged non-normal data. It now takes a `paired` argument (default `False`) and falls back to the appropriate non-parametric test instead of skipping:

@@ -10,8 +10,8 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from itertools import combinations
 
 
-def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, figsize=(3,6),
-                       bar_color="lightgray", dot_color="black", spine_width=2, legend=False):
+def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, title_font_size=14, figsize=(3,6),
+                       bar_color="lightgray", pattern='', dot_color="black", spine_width=2, legend=False, lengend_font_size=14):
     """
     Plot multiple groups as bars with SEM and overlay individual data points.
 
@@ -27,6 +27,10 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
         (width, height) of the figure in inches.
     bar_color : str, optional
         Color of the bars.
+    pattern : str or list of str, optional
+        Hatch pattern(s) for the bars (e.g. '', '///'). Single string applies to all
+        bars; a list is repeated to match n_groups the same way bar_color is, mirroring
+        `plot_bars_with_sem3`.
     dot_color : str, optional
         Color of the overlaid dots.
     spine_width : float, optional
@@ -44,6 +48,19 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
     else:
         bar_colors = [bar_color] * n_groups
 
+    # Allow single pattern or list of patterns (same repeat-to-fit convention as
+    # plot_bars_with_sem3's `pattern` handling)
+    if isinstance(pattern, (list, tuple, np.ndarray)):
+        patterns = list(pattern)
+        if len(patterns) != n_groups:
+            if len(patterns) == 0:
+                patterns = [''] * n_groups
+            else:
+                num_repeats = n_groups / len(patterns)
+                patterns = patterns * int(num_repeats)
+    else:
+        patterns = [pattern] * n_groups
+
     means = [np.nanmean(g) for g in groups]
     sems  = [np.nanstd(g, ddof=1) / np.sqrt(np.sum(~np.isnan(g))) for g in groups]
 
@@ -58,7 +75,7 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
 
     # Bars + SEM
     ax.bar(x, means, yerr=sems, capsize=8,
-           color=bar_colors, edgecolor="black", linewidth=1.5)
+           color=bar_colors, edgecolor="black", hatch=patterns, linewidth=1.5)
 
     # Overlay dots
     for i, vals in enumerate(groups):
@@ -81,10 +98,10 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
     ax.set_xticks(x)
     if legend:
        ax.set_xticklabels([""] * n_groups)
-       handles = [Patch(facecolor=c, edgecolor="black", label=l)
-                  for c, l in zip(bar_colors, labels)]
+       handles = [Patch(facecolor=c, edgecolor="black", hatch=p, label=l)
+                  for c, p, l in zip(bar_colors, patterns, labels)]
        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.05),
-                 ncol=2,fontsize=14)
+                 ncol=2,fontsize=lengend_font_size)
     else:
        ax.set_xticklabels(labels, rotation=angle)
 
@@ -101,7 +118,7 @@ def plot_bars_with_sem3_test(groups, labels=None, ylabel="Value", title= None, f
     ax.yaxis.set_ticks_position("left")
     ax.xaxis.set_ticks_position("bottom")
     if title is not None:
-      ax.set_title(title, fontsize=14, pad=30)
+      ax.set_title(title, fontsize=title_font_size, pad=30)
 
 
     # Add baseline at y = 0
@@ -478,7 +495,7 @@ def pairwise_nonparametric_posthoc(list_arrays, list_labels, paired=False, quiet
 ################################################
 
 
-def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", title=None, bar_color="lightgray", labels = [], quietStats=False, legend=False, paired=False):
+def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", ylim=None, title=None, title_font_size=14, bar_color="lightgray", pattern='', labels = [], quietStats=False, legend=False, lengend_font_size=14,  paired=False):
     
 
     vals_arrays = []
@@ -566,10 +583,13 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", tit
         vals_arrays,
         labels=labels,
         ylabel=ylabel,
-        title = title, 
+        title = title,
+        title_font_size = title_font_size,
         bar_color=bar_color,
+        pattern=pattern,
         figsize=figsize,
         legend=legend,
+        lengend_font_size = lengend_font_size
     )
 
     data_max = max(v.max() for v in vals_arrays)
@@ -579,10 +599,12 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", tit
         add_sig_bar(ax, i1, i2, y, 0.015, p_to_stars(p_adj))
 
     data_min = min(v.min() for v in vals_arrays)
-    bottom = data_min - 0.05 if data_min < 0 else 0
-    top = data_max + 0.1 + bar_step * len(sig_pairs)
-    #ax.set_ylim(bottom, top)
-    ax.set_ylim(0, 0.35)
+    if ylim == None:
+      bottom = data_min - 0.05 if data_min < 0 else 0
+      top = data_max + 0.1 + bar_step * len(sig_pairs)
+      ax.set_ylim(bottom, top)
+    else:
+      ax.set_ylim(ylim[0], ylim[1])
     ax.tick_params(axis="both", labelsize=14)
     ax.yaxis.label.set_size(16)
 
