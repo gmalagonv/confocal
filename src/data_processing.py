@@ -1291,7 +1291,7 @@ def _blind_rl(observed, psf_init, num_iter):
 
 
 def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None, correct_psf = True,  forced2d = False,
-               psf_model='gaussian', algorithm='richardson_lucy'):
+               psf_model='gaussian', algorithm='richardson_lucy', output_tag=''):
     """
     Deconvolve a confocal image using Richardson-Lucy with a theoretical
     PSF derived from the microscope metadata in the .lif file.
@@ -1488,6 +1488,18 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
             rep = rep / rep_scale
         _, psf_est = _blind_rl(rep, _gaussian_psf(sigma_xy_px), num_iter)
         recovered_sigma_xy_px = _psf_sigma_from_kernel(psf_est)
+        # A degenerate representative frame (e.g. no signal above the hot-pixel-corrected
+        # floor, which can happen after aggressive bit-depth quantization) drives the blind
+        # PSF estimate to an all-zero kernel, and _psf_sigma_from_kernel's normalization
+        # (psf / psf.sum()) divides by zero -> NaN. Fail loudly and specifically here rather
+        # than letting that NaN propagate into _gaussian_psf/_odd_ceil, where it surfaces as
+        # an opaque "cannot convert float NaN to integer" several calls downstream.
+        if not np.isfinite(recovered_sigma_xy_px) or recovered_sigma_xy_px <= 0:
+            raise RuntimeError(
+                f"psf_model='estimate' degenerated for scene={scene}, channel={channel}: "
+                f"the representative frame had no usable signal for blind PSF estimation "
+                f"(recovered σ_xy={recovered_sigma_xy_px!r})."
+            )
         print(f"PSF estimate: recovered σ_xy={recovered_sigma_xy_px:.2f} px "
               f"(theoretical estimate was {sigma_xy_px:.2f} px)")
         sigma_xy_px = recovered_sigma_xy_px
@@ -1597,7 +1609,11 @@ def deconvolve(stack, lif_path, channel, scene=0, num_iter=15, emission_nm=None,
     }
     algo_suffix = algo_suffixes[algorithm]
     iter_part = '' if algorithm == 'unsupervised_wiener' else '_iter_' + str(num_iter)
-    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type + psf_suffix + algo_suffix + iter_part + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
+    # output_tag: distinguishes runs on a different INPUT variant of the same series/channel
+    # (e.g. a synthetically bit-depth-quantized copy of the raw stack) from the standard run,
+    # so it can't collide with/overwrite the standard-input output even with identical
+    # psf_model/algorithm/num_iter. Empty by default -- unchanged filenames otherwise.
+    name = date + 's' + str(scene) + '_ch' + str(channel) + '_deconv'+ deconv_type + output_tag + psf_suffix + algo_suffix + iter_part + '.tif' # 2026_05_26_s1_ch0_deconv_iter_4.tif
     
 
     print(name)

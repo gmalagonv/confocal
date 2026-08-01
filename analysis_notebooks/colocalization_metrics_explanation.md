@@ -429,6 +429,27 @@ The following is a record of a real multi-session debugging process (2026-06-05/
 4. **Use accidental duplicate acquisitions as a free noise-floor calibration.** If a dataset contains even one, compare it against the between-animal spread you're trying to interpret — if the technical noise floor is comparable to or larger than the apparent biological effect, no amount of statistics on the existing data will resolve the question.
 5. **Never assume what a naming convention or scene-name suffix means — check the metadata directly, or ask.** A wrong guess here (in this case, assuming a numeric suffix meant zoom level when it meant bit depth) can send an entire analysis down the wrong path.
 
+### Follow-up: does bit depth matter, once the pipeline is fixed?
+
+Once the deconvolution setting was chosen properly (`blind_richardson_lucy`, empirically-corrected PSF, iterations picked by the reproducibility sweep above — see `deconv_iter=7` in `compute_colocalization`'s CLAUDE.md entry), the earlier open question about 8-bit vs 16-bit input was revisited systematically rather than resting on one ambiguous pair.
+
+**Method:** simulate an 8-bit ADC at the same gain (`stack >> 8` on the raw 16-bit data — keeps the top 8 bits, discards the bottom 8; a rescale to fill 0-255 would confound the comparison with an extra brightness/contrast operation), run it through the identical deconvolution + thresholding + `compute_colocalization` pipeline, and compare against the existing 16-bit-derived results, row-matched by sample.
+
+**A real bug surfaced doing this, informative in its own right:** `psf_model='estimate'`'s blind PSF pre-pass uses the middle Z-frame as a representative frame. Under 8-bit quantization, real background values in the 1–255 range collapse to exactly 0 — something that essentially never happens at 16-bit precision — and for one scene this emptied the representative frame entirely, degenerating the recovered PSF to an all-zero kernel and producing a `NaN` that crashed several calls downstream. Fixed by making `deconvolve()` raise a specific, catchable error when this happens, with **no fallback to the theoretical sigma** and **no change to frame selection** — either would make the 8-bit and 16-bit pipelines algorithmically different from each other, not just different in input, which would confound exactly the comparison being run. Instead: skip that one scene/channel, count it, move on.
+
+**One scene (`dec02_5x_brain3gamma_R8`) was excluded from the quantization exercise entirely** — it was already natively acquired at 8-bit, so quantizing it a second time zeroed it out. Not a robustness failure, just a scene that was never a valid candidate for "simulate 8-bit from 16-bit" (it already has a real 8-bit/16-bit comparison on record). Excluding it: **60/60 genuinely-16-bit-source scene/channels succeeded.**
+
+**Result: bit depth has no meaningful effect on any of the four main metrics, under this pipeline.**
+
+| Metric | Discrepancy (8-bit vs 16-bit, n=60) |
+|---|---|
+| Odds ratio (log scale) | mean 1.01x, max 1.02x fold |
+| Enrichment | mean Δ=0.008, max=0.018 |
+| Fraction HSP in Mito | mean Δ=0.001, max=0.004 |
+| Fraction Mito in HSP | mean Δ=0.001, max=0.004 |
+
+For scale: the pipeline's own run-to-run reproducibility floor (same tissue, two independent real acquisitions) was ~1.2x even in the best case — this bit-depth discrepancy is smaller than that noise floor. Likely explanation: the settings chosen here were selected specifically for *not* being in Richardson-Lucy's noise-amplification-prone regime (moderate iteration count, correctly-sized PSF) — the same property that gives run-to-run reproducibility plausibly also gives bit-depth insensitivity. This is *not* a general claim that bit depth never matters for deconvolution — the very first exploration of this question (much earlier, under plain many-iteration Richardson-Lucy) found the opposite: 8-bit looked artificially "cleaner" specifically because quantization had erased real noise before RL could amplify it. The lesson is pipeline-specific: a reproducibility-validated setting is also, incidentally, less input-precision-sensitive; a noise-amplification-prone one would show a real, large bit-depth effect. Don't generalize "bit depth doesn't matter" past the specific deconvolution settings this was tested under.
+
 ### Statistical power for small-n comparisons
 
 Before reporting any group comparison from a small pilot dataset, check explicitly whether the sample size can, even in principle, reach significance:
