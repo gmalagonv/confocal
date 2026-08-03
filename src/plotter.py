@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from scipy.stats import (
     shapiro, levene, f_oneway,
-    mannwhitneyu, wilcoxon, kruskal, friedmanchisquare, rankdata,
+    mannwhitneyu, wilcoxon, kruskal, friedmanchisquare, rankdata, ttest_rel, ttest_ind,
 )
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from itertools import combinations
@@ -374,6 +374,65 @@ def wilcoxon_test(list_arrays, quiet=False):
   return significant, p_value
 
 
+def paired_ttest_test(list_arrays, quiet=False):
+  """Parametric paired test (2 groups, same subjects) -- used instead of wilcoxon_test
+  when the differences pass the normality check, same way anova_test is preferred over
+  kruskal_test for independent groups that pass normality."""
+  stat, p_value = ttest_rel(list_arrays[0], list_arrays[1])
+  if not quiet:
+    print("Paired t-test")
+    print(f"t statistic = {stat:.4f}")
+    print(f"p-value     = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant difference between groups\n" if significant
+          else "→ No significant difference detected\n")
+  return significant, p_value
+
+
+def unpaired_ttest_test(list_arrays, quiet=False):
+  """Parametric independent-samples test (2 groups) -- used instead of mannwhitneyu_test
+  when both groups pass normality (and variance homogeneity). Gives the same p-value as
+  a 2-group one-way ANOVA (f_oneway), just without the Tukey/eta-squared machinery that
+  only makes sense for >2 groups."""
+  stat, p_value = ttest_ind(list_arrays[0], list_arrays[1])
+  if not quiet:
+    print("Independent-samples t-test")
+    print(f"t statistic = {stat:.4f}")
+    print(f"p-value     = {p_value:.4f}")
+
+  significant = p_value < 0.05
+  if not quiet:
+    print("→ Significant difference between groups\n" if significant
+          else "→ No significant difference detected\n")
+  return significant, p_value
+
+
+def two_group_test(list_arrays, labels=None, paired=False, quiet=False):
+  """Shared entry point for 'compare exactly 2 groups, correctly' -- picks the test the
+  same way fast_plotter's own 2-group branch does (normality -> parametric, else
+  non-parametric; paired vs unpaired selects which test family), so any caller doing a
+  standalone 2-group comparison (e.g. one leg of a mixed paired/unpaired multi-group
+  design that fast_plotter itself can't express) gets identical logic instead of an
+  independently-hardcoded, potentially inconsistent choice. Returns (significant,
+  p_value).
+  """
+  if labels is None:
+    labels = ['group1', 'group2']
+  pass_normality = shapiro_wilk(list_arrays, labels, quiet=quiet)
+
+  if paired:
+    if pass_normality:
+      return paired_ttest_test(list_arrays, quiet=quiet)
+    return wilcoxon_test(list_arrays, quiet=quiet)
+
+  pass_similar_var = levene_and_brown_forsythe_test(list_arrays, quiet=quiet)
+  if pass_normality and pass_similar_var:
+    return unpaired_ttest_test(list_arrays, quiet=quiet)
+  return mannwhitneyu_test(list_arrays, quiet=quiet)
+
+
 def kruskal_test(list_arrays, quiet=False):
   """Non-parametric alternative to one-way ANOVA (>2 independent groups)."""
   stat, p_value = kruskal(*list_arrays)
@@ -543,34 +602,59 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", yli
     else:
       pass_similar_var = False
 
+    # `paired` must gate which test family runs BEFORE the normality check, not only
+    # as a fallback once normality/variance-homogeneity fails. Previously, any data
+    # that happened to pass both checks fell into the `pass_normality and
+    # pass_similar_var` branch unconditionally and ran an unpaired one-way ANOVA even
+    # when the caller explicitly passed paired=True -- silently discarding known
+    # within-subject pairing (e.g. two compartments measured in the same animal) and
+    # understating significance, since an unpaired test can't cancel out
+    # between-subject variability the way a paired one does. Normality now only
+    # chooses parametric vs non-parametric *within* the paired/unpaired path the
+    # caller actually asked for.
     sig_pairs = []
-    if pass_normality and pass_similar_var:
-      anova_test(vals_arrays, quiet=quietStats)
-      ETA_SQUARED(vals_arrays, quiet=quietStats)
-
-      tukey = tukey_test(vals_arrays, dates, quiet=quietStats)
-      cohens_all(vals_arrays, dates, quiet=quietStats)
-      sig_pairs = tukey_significant_pairs(tukey, dates)
-
-    elif len(dates) == 2:
-      if paired:
-        significant, p_value = wilcoxon_test(vals_arrays, quiet=quietStats)
+    if paired:
+      if len(dates) == 2:
+        # two_group_test re-runs shapiro_wilk internally (already computed above as
+        # pass_normality) so its printed output stays self-contained when called
+        # standalone elsewhere -- a second, identical call here is cheap and keeps
+        # this branch as a thin wrapper around the single shared implementation
+        # rather than a second copy of the paired-test-selection logic to drift.
+        significant, p_value = two_group_test(vals_arrays, labels=dates, paired=True, quiet=quietStats)
         matched_pairs_rank_biserial(vals_arrays[0], vals_arrays[1], quiet=quietStats)
-      else:
+
+        if significant:
+          sig_pairs = [(0, 1, p_value)]
+
+      elif len(dates) > 2:
+        # Repeated-measures ANOVA isn't implemented here; Friedman (non-parametric) is
+        # used for paired designs with >2 groups regardless of normality -- still a
+        # valid test when the data is normal, just somewhat less powerful than a true
+        # RM-ANOVA would be. Preferable to silently running an unpaired test.
+        significant = friedman_test(vals_arrays, quiet=quietStats)
+        if significant:
+          sig_pairs = pairwise_nonparametric_posthoc(vals_arrays, dates, paired=paired, quiet=quietStats)
+
+    else:
+      if pass_normality and pass_similar_var:
+        anova_test(vals_arrays, quiet=quietStats)
+        ETA_SQUARED(vals_arrays, quiet=quietStats)
+
+        tukey = tukey_test(vals_arrays, dates, quiet=quietStats)
+        cohens_all(vals_arrays, dates, quiet=quietStats)
+        sig_pairs = tukey_significant_pairs(tukey, dates)
+
+      elif len(dates) == 2:
         significant, p_value = mannwhitneyu_test(vals_arrays, quiet=quietStats)
         rank_biserial_effect_size(vals_arrays[0], vals_arrays[1], quiet=quietStats)
 
-      if significant:
-        sig_pairs = [(0, 1, p_value)]
+        if significant:
+          sig_pairs = [(0, 1, p_value)]
 
-    elif len(dates) > 2:
-      if paired:
-        significant = friedman_test(vals_arrays, quiet=quietStats)
-      else:
+      elif len(dates) > 2:
         significant = kruskal_test(vals_arrays, quiet=quietStats)
-
-      if significant:
-        sig_pairs = pairwise_nonparametric_posthoc(vals_arrays, dates, paired=paired, quiet=quietStats)
+        if significant:
+          sig_pairs = pairwise_nonparametric_posthoc(vals_arrays, dates, paired=paired, quiet=quietStats)
 
 
 
