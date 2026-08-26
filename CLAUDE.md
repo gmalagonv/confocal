@@ -361,6 +361,85 @@ All three `26_06_*_all_b.ipynb` notebooks call this with `deconv_iter=7, raw=Fal
 
 Pass `paired=True` when comparing two columns derived from the *same* rows/brains (e.g. `MB_syn_*` vs `MB_non_syn_*` for the same brain) — this is the common case in `pooled_results.ipynb`.
 
+## Mushroom body extraction via atlas registration (2026_07_30_Lisa dataset)
+
+**Why this exists**: `2026_07_30_Lisa` has no MB-specific driver — ch0 is nc82 (pan-neuronal/
+synaptic neuropil, whole brain) and ch1 is 5HT (also broadly expressed) — so there's no local
+intensity contrast to segment the MB directly (rules out thresholding, and rules out raw
+SAM/micro-sam segmentation too, since that also needs *some* contrast to lock onto). Instead,
+each scene's nc82 channel is **registered to the JFRC2 standard brain**, which already has the
+MB outlined, and that outline is warped back onto the scene. Strategy follows Peng et al. 2011
+(*Nat. Methods* 8:493-500, BrainAligner) and Jenett et al. 2012 (*Cell Reports* 2:991-1001,
+"Annotation" section) — same target template space, different registration software/landmark
+method (ANTsPy + manual point-picking, not BrainAligner's automatic RLM landmark detection).
+
+- **Notebook**: `analysis_notebooks/26_07_30_Lisa_MB_registration.ipynb` — git-tracked, edited
+  directly (hand-edit cells in the notebook itself, same as any other notebook in this repo).
+  An earlier session generated it via a throwaway Python script instead of hand-editing cells,
+  which caused one near-miss (re-running the generator after the notebook had real execution
+  outputs and a manual edit silently wiped both; caught immediately and recovered via
+  `git checkout` since it was already committed) — that script has been deleted, don't
+  recreate the pattern.
+- **New dependency**: `antspyx` (ANTsPy), installed via `pip install antspyx` in `leica-env`
+  (not tested via conda-forge). This downgraded `scipy` 1.16.3→1.15.3 and flagged a non-fatal
+  `imageio`/`scikit-image` version conflict on install — confirmed `data_processing.py`,
+  `colocalization.py`, `plotter.py` all still import and work fine afterward. Needs installing
+  fresh on any other machine.
+- **Atlas data** (NOT in git, ~59 MB, must be copied or re-downloaded separately per machine):
+  `~/data/confocal/atlas_JFRC2/` — `JFRCtemplate2010.nrrd` (template, itself nc82-stained,
+  shape (1024,512,218), spacing 0.622 µm isotropic, native axis order **(X,Y,Z)**),
+  `JFRCtempate2010.mask130819_Original.nrrd` (integer region-label mask, same shape/order),
+  `Original_Index.tsv` (label ID → region name). Source: `VirtualFlyBrain/DrosAdultBRAINdomains`
+  on GitHub (Ito et al. 2014 neuropil nomenclature, *Neuron* 81:755-765).
+- **MB region label IDs** (from `Original_Index.tsv`'s "Stack id" column — 4 sub-structures ×
+  2 hemispheres): whole MB = `[17,18,19,36,64,65,66,81]` (pedunculus, vertical lobe, medial
+  lobe, calyx; R then L). Lobes only (vertical + medial lobe, excluding peduncle tract and
+  calyx) = `[18,19,65,66]`.
+
+### Key gotchas found while building this (all now fixed in the notebook, kept here so they
+aren't rediscovered from scratch on a fresh machine/session)
+- **Axis order mismatch, tracked everywhere by hand**: the atlas NRRD's native array order is
+  **(X, Y, Z)**; `aicsimageio`'s `get_image_data('ZYX', ...)` stacks are **(Z, Y, X)**. These
+  are never silently conflated — every napari display, point-index conversion, and coverage
+  check explicitly accounts for which convention it's in. Got this wrong once in a QC
+  diagnostic (printed per-axis coverage labeled `['X','Y','Z']` against an array that was
+  actually `(Z,Y,X)`-ordered) and it produced a convincing-looking phantom "X coverage
+  problem" that was actually Z (which was expected to be low — see crop note below). Fixed by
+  using explicit named variables instead of parallel positional arrays.
+- **napari `add_points()` silently defaults to `ndim=2`** even for a 3D image, unless `ndim=3`
+  is passed explicitly — causes a downstream `IndexError` when converting clicked points.
+- **Landmark-fitted initial transform must allow reflection.** `ants.fit_transform_to_paired_
+  points(transform_type='rigid'/'similarity')` forcibly rejects reflections (forces the fit to
+  a proper rotation, det=+1) even when the true correspondence between two point sets is a
+  mirror flip (det=-1) — this distorts whichever axis absorbs the correction, while leaving
+  pairwise landmark distances (reflection-invariant) looking perfectly clean, so it doesn't
+  show up in the obvious sanity check. Diagnosed via the sign of the Kabsch alignment
+  determinant; fixed with a custom Umeyama-style similarity fit that allows reflection
+  (`_fit_similarity_allow_reflection` in the notebook/build script) instead of using ants' own
+  constrained fit.
+- **Template Z-crop is deliberately left at full atlas range** (no read yet on where in Z each
+  scene sits within the brain) — so a registered scene's Z-canvas coverage is *expected* to
+  fall well short of 100%, capped at `(scene Z depth) / (template Z crop depth)`. Don't mistake
+  this for a bad fit — check X/Y coverage (which *are* cropped to match the scene) instead.
+- **Quantitative registration QC beats eyeballing images** — a grid of template points mapped
+  through the fitted transform, checked against what fraction land inside the scene's actual
+  valid data range, catches real problems (mis-scaled/reflected transforms) that a symmetric-
+  looking Z-projection can pass by coincidence. This was a direct, explicit correction after
+  initially misjudging a registration as "good" from a picture alone.
+
+### Status as of 2026-08-27
+Landmark-based registration (5 manually-clicked points, reflection-allowing similarity fit +
+ANTs SyN) validated for **scene 0 only** via the quantitative coverage check (X/Y ~99%, Z at
+its expected ~63% ceiling) — not yet confirmed by warping the MB mask back and visually
+checking it lands on a plausible structure, and not yet run for the other 3 scenes
+(`NGS_20min` done; `Rotiblock_20min`, `NGS_40min`, `RotiBlock_40min` pending — the notebook's
+batch loop for this exists but is commented out until scene 0 is fully trusted). SAM/micro-sam
+mask-prompted refinement (using the warped MB mask as a per-frame prompt to tighten boundaries)
+was discussed as a possible follow-up — mechanically supported by micro-sam, but not yet tried;
+recommended only *after* confirming the registration mask lands in a plausible neighborhood,
+not as a substitute for that check, since SAM will confidently snap to *some* nearby boundary
+regardless of whether it started in the right place.
+
 ## Notes
 - `.lif` metadata contains NA, refractive index, voxel sizes, and per-channel spectral bands — always prefer reading from metadata over hardcoding
 - `signal_extractor` returns `results[frame][roi_num]` as strings keys
