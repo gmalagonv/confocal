@@ -677,15 +677,24 @@ def fast_plotter(dates,  df=None, figsize=(6,6), ylabel="Performance Index", yli
     )
 
     data_max = max(v.max() for v in vals_arrays)
-    bar_step = 0.04
-    for k, (i1, i2, p_adj) in enumerate(sig_pairs):
-        y = data_max + 0.04 + k * bar_step
-        add_sig_bar(ax, i1, i2, y, 0.015, p_to_stars(p_adj))
-
     data_min = min(v.min() for v in vals_arrays)
+    # Significance-bracket geometry, scaled to the data range. These offsets/heights were
+    # hardcoded for ~0-1-scale data (+0.04 above data_max, 0.04 step, 0.015 bracket height,
+    # +0.1 headroom); on any larger y-scale (raw intensities, counts, ...) the brackets landed
+    # right on top of the tallest bar and the axes had no room above them, so the stars were
+    # hidden behind the title. Now everything is a fraction of the plotted span.
+    span = (data_max - min(data_min, 0.0)) or 1.0
+    first_off = 0.08 * span      # gap between the tallest bar and the first bracket
+    bar_step  = 0.09 * span      # vertical spacing between stacked brackets
+    bar_h     = 0.025 * span     # bracket "tick" height
+    for k, (i1, i2, p_adj) in enumerate(sig_pairs):
+        y = data_max + first_off + k * bar_step
+        add_sig_bar(ax, i1, i2, y, bar_h, p_to_stars(p_adj))
+
     if ylim == None:
-      bottom = data_min - 0.05 if data_min < 0 else 0
-      top = data_max + 0.1 + bar_step * len(sig_pairs)
+      bottom = data_min - 0.05 * span if data_min < 0 else 0
+      n_bars = max(len(sig_pairs), 1)
+      top = data_max + first_off + (n_bars - 1) * bar_step + bar_h + 0.14 * span
       ax.set_ylim(bottom, top)
     else:
       ax.set_ylim(ylim[0], ylim[1])
